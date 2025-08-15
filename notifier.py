@@ -1,15 +1,27 @@
 """
-Arb Notifier with Test Mode — run manually to send a test message via Telegram.
-"""
+ENG Arb Notifier — scans EPL, Championship, League One, League Two every 30 minutes
+Sends Telegram message when NEW arbs are found (filtered to Paddy/Betfair/Sky).
 
-import os, sys, json, hashlib
-from typing import Dict, List, Tuple
-import requests
-from dateutil import parser as dtparser
+Env:
+- ODDS_API_KEY (required)
+- TELEGRAM_BOT_TOKEN (required)
+- TELEGRAM_CHAT_ID (required)
+- MIN_ROI_PCT (optional, default 0.2)
+- REGIONS (optional, default "uk,eu")
+- TEST_MODE (optional, "true" to send a quick hello)
+"""
+import os, sys, json, hashlib, requests
+from typing import Dict, List
 
 BASE_URL = "https://api.the-odds-api.com/v4"
+SPORTS = [
+    ("EPL", "soccer_epl"),
+    ("Championship", "soccer_efl_championship"),
+    ("League One", "soccer_england_league1"),
+    ("League Two", "soccer_england_league2"),
+]
 
-TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
+TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
 
 def is_target_book(name: str) -> bool:
     n = (name or "").lower()
@@ -17,118 +29,98 @@ def is_target_book(name: str) -> bool:
 
 def implied_prob(odds: float, commission: float = 0.0) -> float:
     eff = odds * (1 - commission)
-    if eff <= 0: 
-        return 1e9
-    return 1.0 / eff
+    return 1.0/eff if eff>0 else 1e9
 
 def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[str]) -> List[dict]:
-    params = {
-        "apiKey": api_key,
-        "regions": ",".join(regions),
-        "markets": ",".join(markets),
-        "oddsFormat": "decimal",
-    }
     url = f"{BASE_URL}/sports/{sport_key}/odds"
-    r = requests.get(url, params=params, timeout=20)
+    r = requests.get(url, params={"apiKey": api_key, "regions": ",".join(regions), "markets": ",".join(markets), "oddsFormat":"decimal"}, timeout=20)
     r.raise_for_status()
     return r.json()
 
-def compute_arbs(events: List[dict], min_roi_pct: float, commission_map: Dict[str, float]) -> List[dict]:
-    found = []
+def compute_arbs_for_events(events: List[dict], min_roi_pct: float, commission_map: Dict[str, float], league_label: str) -> List[dict]:
+    out = []
     for ev in events:
-        home = ev.get("home_team")
-        away = ev.get("away_team")
+        home, away = ev.get("home_team"), ev.get("away_team")
         best = {}
         for bk in ev.get("bookmakers", []):
             book_name = bk.get("title") or bk.get("key")
-            for market in bk.get("markets", []):
-                if market.get("key") != "h2h":
-                    continue
-                for outcome in market.get("outcomes", []):
-                    name = outcome.get("name")
-                    price = float(outcome.get("price"))
-                    if name not in best or price > best[name][0]:
-                        best[name] = (price, book_name)
+            for m in bk.get("markets", []):
+                if m.get("key") != "h2h": continue
+                for o in m.get("outcomes", []):
+                    name, price = o.get("name"), float(o.get("price"))
+                    if name not in best or price > best[name][0]: best[name] = (price, book_name)
         name_map = {}
-        for k, v in list(best.items()):
+        for k,v in best.items():
             low = k.lower()
-            if "draw" in low:
-                name_map["Draw"] = v
-            elif home and home.lower() in low:
-                name_map["Home"] = v
-            elif away and away.lower() in low:
-                name_map["Away"] = v
-        if not all(x in name_map for x in ["Home", "Draw", "Away"]):
-            continue
-
-        triplet = [("Home", *name_map["Home"]), ("Draw", *name_map["Draw"]), ("Away", *name_map["Away"])]
-        if not any(is_target_book(b) for (_, _, b) in triplet):
-            continue
-
-        implieds = [implied_prob(o, commission_map.get(b, 0.0)) for (_, o, b) in triplet]
+            if "draw" in low: name_map["Draw"] = v
+            elif home and home.lower() in low: name_map["Home"] = v
+            elif away and away.lower() in low: name_map["Away"] = v
+        if not all(x in name_map for x in ["Home","Draw","Away"]): continue
+        triplet = [("Home",*name_map["Home"]),("Draw",*name_map["Draw"]),("Away",*name_map["Away"])]
+        if not any(is_target_book(b) for (_,_,b) in triplet): continue
+        implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in triplet]
         margin = 1.0 - sum(implieds)
-        roi_pct = max(margin * 100.0, 0.0)
-        if roi_pct >= min_roi_pct:
-            found.append({
-                "match": f"{home} vs {away}",
-                "best_home": f"{triplet[0][1]} @ {triplet[0][2]}",
-                "best_draw": f"{triplet[1][1]} @ {triplet[1][2]}",
-                "best_away": f"{triplet[2][1]} @ {triplet[2][2]}",
-                "roi_pct": round(roi_pct, 3),
-            })
-    return found
+        roi = max(margin*100.0, 0.0)
+        if roi >= min_roi_pct:
+            out.append({"league": league_label,
+                        "match": f"{home} vs {away}",
+                        "best_home": f"{triplet[0][1]} @ {triplet[0][2]}",
+                        "best_draw": f"{triplet[1][1]} @ {triplet[1][2]}",
+                        "best_away": f"{triplet[2][1]} @ {triplet[2][2]}",
+                        "roi_pct": round(roi,3)})
+    return out
 
-def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    r = requests.post(url, json=payload, timeout=20)
-    r.raise_for_status()
+def telegram_send(token: str, chat_id: str, text: str):
+    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={"chat_id": chat_id, "text": text, "parse_mode":"HTML","disable_web_page_preview":True},
+                  timeout=20).raise_for_status()
 
 def main():
-    api_key = os.environ.get("ODDS_API_KEY")
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    min_roi = float(os.environ.get("MIN_ROI_PCT", "0.2"))
-    regions = [x.strip() for x in os.environ.get("REGIONS", "uk,eu").split(",") if x.strip()]
-    test_mode = os.environ.get("TEST_MODE", "").lower() in ("1", "true", "yes")
-
-    if not (bot_token and chat_id):
-        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr)
-        sys.exit(1)
-
+    test_mode = os.environ.get("TEST_MODE","").lower() in ("1","true","yes")
+    if not (token and chat_id):
+        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr); sys.exit(1)
     if test_mode:
-        telegram_send(bot_token, chat_id, "✅ Test message from EPL Arb Notifier — your Telegram setup works!")
-        print("Test message sent.")
-        return
-
+        telegram_send(token, chat_id, "✅ Test from ENG Arb Notifier — your Telegram is wired up."); print("Test sent."); return
+    api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
-        print("Missing ODDS_API_KEY", file=sys.stderr)
-        sys.exit(1)
+        print("Missing ODDS_API_KEY", file=sys.stderr); sys.exit(1)
+    min_roi = float(os.environ.get("MIN_ROI_PCT","0.2"))
+    regions = [x.strip() for x in os.environ.get("REGIONS","uk,eu").split(",") if x.strip()]
 
-    events = fetch_odds(api_key, "soccer_epl", regions, ["h2h"])
-    commission_map: Dict[str, float] = {}
-    arbs = compute_arbs(events, min_roi, commission_map)
-    if not arbs:
-        print("No arbs this run.")
-        return
+    all_arbs = []
+    for (label, sport_key) in SPORTS:
+        try:
+            events = fetch_odds(api_key, sport_key, regions, ["h2h"])
+        except Exception as e:
+            print(f"Fetch failed for {label}: {e}", file=sys.stderr)
+            continue
+        all_arbs.extend(compute_arbs_for_events(events, min_roi, commission_map={}, league_label=label))
 
-    digest = hashlib.sha256(json.dumps(arbs, sort_keys=True).encode("utf-8")).hexdigest()
-    state_file = ".arb_state_hash"
-    last = None
-    if os.path.exists(state_file):
-        last = open(state_file, "r").read().strip()
-    if digest == last:
-        print("Arbs unchanged; not sending notification.")
-        return
-    with open(state_file, "w") as f:
-        f.write(digest)
+    if not all_arbs:
+        print("No arbs this run."); return
 
-    lines = ["<b>New EPL arbs found</b> (includes Paddy/Betfair/Sky):"]
-    for a in arbs[:10]:
-        lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%\n  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}")
-    msg = "\n".join(lines)
-    telegram_send(bot_token, chat_id, msg)
-    print(f"Sent {len(arbs)} arbs.")
+    digest = hashlib.sha256(json.dumps(all_arbs, sort_keys=True).encode("utf-8")).hexdigest()
+    state_file = ".arb_state_hash"; prev = open(state_file).read().strip() if os.path.exists(state_file) else None
+    if digest == prev: print("Arbs unchanged; not sending."); return
+    with open(state_file,"w") as f: f.write(digest)
+
+    # Build message per league, cap total lines
+    lines = ["<b>New ENG arbs found</b> (incl. Paddy/Betfair/Sky):"]
+    count = 0
+    for league in ["EPL", "Championship", "League One", "League Two"]:
+        chunk = [a for a in all_arbs if a["league"] == league]
+        if not chunk: continue
+        lines.append(f"\n<b>{league}</b>")
+        for a in chunk[:5]:  # up to 5 per league
+            lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%\n  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}")
+            count += 1
+            if count >= 12: break
+        if count >= 12: break
+
+    telegram_send(token, chat_id, "\n".join(lines))
+    print(f"Sent {len(all_arbs)} arbs.")
 
 if __name__ == "__main__":
     main()
