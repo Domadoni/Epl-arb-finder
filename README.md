@@ -1,27 +1,34 @@
 
-# English Football Arbitrage Suite — EPL + Championship + League One + League Two
+# ENG Arbitrage — All-in-one UI + Minutely Notifier (window-gated)
 
-Includes:
-- `app.py` — Streamlit UI (pick league in sidebar; optional Telegram alerts + 30‑min auto-refresh while open)
-- `notifier.py` — GitHub Actions script scanning **EPL, Championship, League One, League Two** every 30 minutes
-- `.github/workflows/arb_notifier.yml` — the 30‑minute schedule
-- `requirements.txt` — app dependencies
+This repo combines:
+- **Streamlit UI** that aggregates EPL, Championship, League One, League Two, FA Cup, EFL Cup on a single screen (multi-select). Includes Telegram test + session alerts and optional 30‑min auto‑refresh while open.
+- **GitHub Actions notifier** that runs every minute but only executes:
+  - every minute between your configured window (e.g., **12:00–17:00 Europe/Dublin** on the date you set), and
+  - every **30 minutes** outside that window.
 
-## Streamlit deploy
-1. Create a GitHub repo; upload these files.
-2. Deploy to Streamlit Community Cloud → `app.py`.
-3. Paste your **The Odds API** key in the sidebar. (Optional) add Telegram token/chat id and hit **Send test**.
+## Deploy the UI (Streamlit Community Cloud)
+1. Upload this repo to GitHub.
+2. Deploy `app.py` via https://share.streamlit.io.
+3. In the app sidebar, paste your **The Odds API** key. Optionally add Telegram token & chat id and click **Send test**.
 
-## GitHub Actions notifier
-1. In repo **Settings → Secrets and variables → Actions**, add:
-   - `ODDS_API_KEY`
-   - `TELEGRAM_BOT_TOKEN`
-   - `TELEGRAM_CHAT_ID`
-2. (Optional) add `MIN_ROI_PCT` (default `0.2`) and `REGIONS` (default `uk,eu`).
-3. The workflow runs every 30 minutes. You can also **Run workflow** manually.
+## Enable notifications
+In GitHub **Settings → Secrets and variables → Actions**:
+
+**Secrets**
+- `ODDS_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+**Variables**
+- `TIMEZONE` = `Europe/Dublin`
+- `RAPID_WINDOW_START_ISO` = e.g. `2025-08-16T12:00:00`
+- `RAPID_WINDOW_END_ISO`   = e.g. `2025-08-16T17:00:00`
+- (Optional) `MIN_ROI_PCT` (default `0.2`), `REGIONS` (default `uk,eu`)
+
+The workflow triggers every minute but the script gates itself to your window; outside the window it only runs on minute `00` and `30`.
 
 ## Notes
-- Sport keys used (The Odds API): `soccer_epl`, `soccer_efl_championship`, `soccer_england_league1`, `soccer_england_league2`.
-- Only 1X2 (h2h) is scanned in this example; extend to spreads/totals if you want.
-- Optional filter to only show arbs with **Paddy Power / Betfair / Sky Bet**.
-- Odds change quickly; always confirm prices before staking and respect limits/laws.
+- Sport keys used (The Odds API): `soccer_epl`, `soccer_efl_championship`, `soccer_england_league1`, `soccer_england_league2`, `soccer_fa_cup`, `soccer_efl_cup`.
+- Only 1X2 is scanned in this example; extend as needed.
+- Keep your Telegram bot token **private**; never commit it to code.

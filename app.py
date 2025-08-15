@@ -1,5 +1,11 @@
 """
-Arbitrage Suite — Streamlit UI (EPL + Championship + League One + League Two) with Telegram alerts
+English Football Arbitrage Finder — All competitions on one screen
+Covers: EPL, Championship, League One, League Two, FA Cup, EFL Cup
+- Multi-select competitions (default: all)
+- Combined results table with league labels
+- Per-match expanders with stake plans
+- Optional bookmaker filter (Paddy/Betfair/Sky)
+- Telegram alerts (session-based) + optional 30-min auto-refresh
 """
 import math, time, hashlib, json
 from typing import Dict, List, Tuple
@@ -17,6 +23,7 @@ SPORT_KEYS = {
     "EFL League One": "soccer_england_league1",
     "EFL League Two": "soccer_england_league2",
     "FA Cup": "soccer_fa_cup",
+    "EFL Cup (Carabao Cup)": "soccer_efl_cup",
 }
 
 DEFAULT_REGIONS = ["uk", "eu"]
@@ -78,8 +85,8 @@ def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[s
         raise RuntimeError(f"API error {r.status_code}: {r.text}")
     return r.json()
 
-st.set_page_config(page_title="Arb Finder (ENG tiers)", page_icon="⚽", layout="wide")
-st.title("⚽ English Football Arbitrage Finder (1X2)")
+st.set_page_config(page_title="ENG Arb Finder — All comps", page_icon="⚽", layout="wide")
+st.title("⚽ English Football Arbitrage Finder — All competitions on one screen")
 
 # Auto-refresh every 30 minutes while page open
 if "last_tick" not in st.session_state:
@@ -91,7 +98,7 @@ elif time.time() - st.session_state["last_tick"] > 30*60:
 with st.sidebar:
     st.header("Settings")
     api_key = st.text_input("The Odds API key", type="password")
-    sport_label = st.selectbox("Competition", list(SPORT_KEYS.keys()), index=0)
+    comps = st.multiselect("Competitions", list(SPORT_KEYS.keys()), default=list(SPORT_KEYS.keys()))
     regions = st.multiselect("Regions (bookmaker regions)", ["uk","eu","us","au"], default=DEFAULT_REGIONS)
     market_label = st.selectbox("Market", list(SUPPORTED_MARKETS.keys()), index=0)
     bankroll = st.number_input("Bankroll to allocate per bet (£)", min_value=0.0, value=100.0, step=10.0)
@@ -121,88 +128,154 @@ with st.sidebar:
         telegram_send(bot_token, chat_id, "✅ Test from ENG Arb Finder — your Telegram is wired up.")
         st.success("Test sent (check Telegram).")
 
-sport_key = SPORT_KEYS[sport_label]; market_key = SUPPORTED_MARKETS[market_label]
-
 if not api_key:
     st.info("Enter your API key in the sidebar to fetch live odds."); st.stop()
 
-try:
-    events = fetch_odds(api_key, sport_key, regions, [market_key])
-except Exception as e:
-    st.error(f"Failed to fetch odds: {e}"); st.stop()
+market_key = SUPPORTED_MARKETS[market_label]
 
-if include_commission and events:
-    all_books = sorted({b.get("title", b.get("key","")) for ev in events for b in ev.get("bookmakers",[]) })
-    with st.sidebar:
-        for bk in all_books:
-            key = f"commission_{bk}"
-            pct = st.number_input(f"{bk}", min_value=0.0, max_value=0.10, value=0.0, step=0.005, key=key)
-            commission_map[bk] = pct
-
-records = []
-for ev in events:
-    home = ev.get("home_team"); away = ev.get("away_team")
-    commence_time = dtparser.parse(ev.get("commence_time")) if ev.get("commence_time") else None
-
-    best = {}
-    for bk in ev.get("bookmakers", []):
-        book_name = bk.get("title") or bk.get("key")
-        for market in bk.get("markets", []):
-            if market.get("key") != market_key: continue
-            for outcome in market.get("outcomes", []):
-                name = outcome.get("name"); price = float(outcome.get("price"))
-                if name not in best or price > best[name][0]: best[name] = (price, book_name)
-
-    if market_key == "h2h":
-        needed = [home, "Draw", away]; name_map = {}
-        for k in list(best.keys()):
-            low = k.lower()
-            if "draw" in low: name_map["Draw"] = best[k]
-            elif home and home.lower() in low: name_map[home] = best[k]
-            elif away and away.lower() in low: name_map[away] = best[k]
-        if not all(x in name_map for x in needed): continue
-        best_triplet = [("Home", name_map[home][0], name_map[home][1]), ("Draw", name_map["Draw"][0], name_map["Draw"][1]), ("Away", name_map[away][0], name_map[away][1])]
-    else:
+# Fetch odds for all chosen competitions
+all_records = []
+fetch_errors = []
+for comp in comps:
+    sport_key = SPORT_KEYS[comp]
+    try:
+        events = fetch_odds(api_key, sport_key, regions, [market_key])
+    except Exception as e:
+        fetch_errors.append(f"{comp}: {e}")
         continue
 
-    if filter_to_target:
-        books_in_arb = {b for (_,_,b) in best_triplet}
-        if not any(is_target_book(b) for b in books_in_arb): continue
+    # Commission map inputs per comp (optional)
+    if include_commission and events:
+        all_books = sorted({b.get("title", b.get("key","")) for ev in events for b in ev.get("bookmakers",[]) })
+        with st.sidebar:
+            st.caption(f"Commission for books (visible in {comp})")
+            for bk in all_books:
+                key = f"commission_{comp}_{bk}"
+                pct = st.number_input(f"{bk}", min_value=0.0, max_value=0.10, value=0.0, step=0.005, key=key)
+                commission_map[bk] = pct
 
-    implieds = [1.0/(o*(1-commission_map.get(b,0.0))) for (_,o,b) in best_triplet]
-    margin = 1.0 - sum(implieds)
-    roi_est = max(margin*100.0, 0.0)
+    for ev in events:
+        home = ev.get("home_team"); away = ev.get("away_team")
+        commence_time = dtparser.parse(ev.get("commence_time")) if ev.get("commence_time") else None
 
-    if roi_est >= min_roi:
-        plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_triplet, bankroll, commission_map)
-        records.append({"Match": f"{home} vs {away}", "Kickoff": commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else "", "Best Home": f"{best_triplet[0][1]} @ {best_triplet[0][2]}", "Best Draw": f"{best_triplet[1][1]} @ {best_triplet[1][2]}", "Best Away": f"{best_triplet[2][1]} @ {best_triplet[2][2]}", "Arb Margin %": round(margin2*100,3), "Plan": plan_df})
+        best = {}
+        for bk in ev.get("bookmakers", []):
+            book_name = bk.get("title") or bk.get("key")
+            for market in bk.get("markets", []):
+                if market.get("key") != market_key: continue
+                for outcome in market.get("outcomes", []):
+                    name = outcome.get("name"); price = float(outcome.get("price"))
+                    if name not in best or price > best[name][0]: best[name] = (price, book_name)
 
-st.subheader("Results")
-if not records:
-    msg = "No surebets found at the current thresholds."
-    if filter_to_target: msg += " (Filtered to Paddy/Betfair/Sky.)"
+        if market_key == "h2h":
+            needed = [home, "Draw", away]; name_map = {}
+            for k in list(best.keys()):
+                low = k.lower()
+                if "draw" in low: name_map["Draw"] = best[k]
+                elif home and home.lower() in low: name_map[home] = best[k]
+                elif away and away.lower() in low: name_map[away] = best[k]
+            if not all(x in name_map for x in needed): continue
+            best_triplet = [("Home", name_map[home][0], name_map[home][1]), ("Draw", name_map["Draw"][0], name_map["Draw"][1]), ("Away", name_map[away][0], name_map[away][1])]
+        else:
+            continue
+
+        if filter_to_target:
+            books_in_arb = {b for (_,_,b) in best_triplet}
+            if not any(is_target_book(b) for b in books_in_arb): continue
+
+        implieds = [1.0/(o*(1-commission_map.get(b,0.0))) for (_,o,b) in best_triplet]
+        margin = 1.0 - sum(implieds)
+        roi_est = max(margin*100.0, 0.0)
+
+        if roi_est >= min_roi:
+            plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_triplet, bankroll, commission_map)
+            all_records.append({
+                "Competition": comp,
+                "Match": f"{home} vs {away}",
+                "Kickoff": commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else "",
+                "Best Home": f"{best_triplet[0][1]} @ {best_triplet[0][2]}",
+                "Best Draw": f"{best_triplet[1][1]} @ {best_triplet[1][2]}",
+                "Best Away": f"{best_triplet[2][1]} @ {best_triplet[2][2]}",
+                "Arb Margin %": round(margin2*100, 3),
+                "Plan": plan_df,
+            })
+
+# Display any fetch errors
+if fetch_errors:
+    with st.expander("Data fetch notes"):
+        for e in fetch_errors:
+            st.info(e)
+
+# Combined summary table
+st.subheader("Summary of opportunities (all selected competitions)")
+if not all_records:
+    msg = "No surebets found at the current thresholds"
+    if filter_to_target: msg += " (filtered by bookmaker)."
     st.warning(msg + " Try lowering the ROI filter or refreshing.")
 else:
-    for rec in records:
-        with st.expander(f"{rec['Match']} — Kickoff {rec['Kickoff']} — Margin {rec['Arb Margin %']}%"):
-            c1,c2,c3 = st.columns(3)
-            with c1: st.metric("Best Home", rec["Best Home"].split(" @ ")[0], help=rec["Best Home"].split(" @ ")[1])
-            with c2: st.metric("Best Draw", rec["Best Draw"].split(" @ ")[0], help=rec["Best Draw"].split(" @ ")[1])
-            with c3: st.metric("Best Away", rec["Best Away"].split(" @ ")[0], help=rec["Best Away"].split(" @ ")[1])
-            st.dataframe(rec["Plan"], use_container_width=True)
+    summary_df = pd.DataFrame([{
+        "Competition": r["Competition"],
+        "Match": r["Match"],
+        "Kickoff": r["Kickoff"],
+        "Best Home": r["Best Home"],
+        "Best Draw": r["Best Draw"],
+        "Best Away": r["Best Away"],
+        "Arb Margin %": r["Arb Margin %"],
+    } for r in all_records]).sort_values(["Competition", "Kickoff", "Match"])
+    st.dataframe(summary_df, use_container_width=True)
 
-if records:
-    flat = [{"Match": r["Match"], "Kickoff": r["Kickoff"], "Best Home": r["Best Home"], "Best Draw": r["Best Draw"], "Best Away": r["Best Away"], "Arb Margin %": r["Arb Margin %"]} for r in records]
+    # Per-match details grouped by competition
+    st.subheader("Details")
+    for comp in sorted(set(r["Competition"] for r in all_records)):
+        st.markdown(f"### {comp}")
+        comp_records = [r for r in all_records if r["Competition"] == comp]
+        for rec in comp_records:
+            with st.expander(f"{rec['Match']} — {rec['Kickoff']} — Margin {rec['Arb Margin %']}%"):
+                c1,c2,c3 = st.columns(3)
+                with c1: st.metric("Best Home", rec["Best Home"].split(" @ ")[0], help=rec["Best Home"].split(" @ ")[1])
+                with c2: st.metric("Best Draw", rec["Best Draw"].split(" @ ")[0], help=rec["Best Draw"].split(" @ ")[1])
+                with c3: st.metric("Best Away", rec["Best Away"].split(" @ ")[0], help=rec["Best Away"].split(" @ ")[1])
+                st.dataframe(rec["Plan"], use_container_width=True)
+
+# Download CSV of opportunities
+if all_records:
+    flat = [{
+        "Competition": r["Competition"],
+        "Match": r["Match"],
+        "Kickoff": r["Kickoff"],
+        "Best Home": r["Best Home"],
+        "Best Draw": r["Best Draw"],
+        "Best Away": r["Best Away"],
+        "Arb Margin %": r["Arb Margin %"],
+    } for r in all_records]
     csv = pd.DataFrame(flat).to_csv(index=False).encode("utf-8")
-    st.download_button("Download summary CSV", data=csv, file_name="surebets_summary.csv", mime="text/csv")
+    st.download_button("Download summary CSV", data=csv, file_name="surebets_summary_all_competitions.csv", mime="text/csv")
 
-arb_summaries = [{"match": r["Match"], "best_home": r["Best Home"], "best_draw": r["Best Draw"], "best_away": r["Best Away"], "margin_pct": r["Arb Margin %"]} for r in records]
-curr_digest = hashlib.sha256(json.dumps(arb_summaries, sort_keys=True).encode("utf-8")).hexdigest()
+# Session-based Telegram notification for NEW arbs
+arb_summaries = [{
+    "comp": r["Competition"],
+    "match": r["Match"],
+    "best_home": r["Best Home"],
+    "best_draw": r["Best Draw"],
+    "best_away": r["Best Away"],
+    "margin_pct": r["Arb Margin %"],
+} for r in all_records]
+curr_digest = hash_arbs_summary(arb_summaries)
 prev_digest = st.session_state.get("last_arb_digest")
+
 if 'notify_live' in locals() and notify_live and arb_summaries and curr_digest != prev_digest:
-    lines = ["<b>New arbs found</b>:" + (" (incl. Paddy/Betfair/Sky)" if filter_to_target else "")]
-    for a in arb_summaries[:10]:
-        lines.append(f"• {a['match']} — Margin ~ {a['margin_pct']}%\n  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}")
+    lines = ["<b>New arbs found</b> across selected competitions" + (" (incl. Paddy/Betfair/Sky)" if filter_to_target else "")]
+    # group by comp
+    comps_in_results = sorted(set(a["comp"] for a in arb_summaries))
+    for comp in comps_in_results:
+        lines.append(f"\n<b>{comp}</b>")
+        chunk = [a for a in arb_summaries if a["comp"] == comp][:5]
+        for a in chunk:
+            lines.append(
+                f"• {a['match']} — Margin ~ {a['margin_pct']}%\n"
+                f"  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}"
+            )
     telegram_send(bot_token, chat_id, "\n".join(lines))
     st.toast("Sent Telegram alert for new arbs ✅", icon="✅")
+
 st.session_state["last_arb_digest"] = curr_digest

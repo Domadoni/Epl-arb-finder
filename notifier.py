@@ -1,17 +1,27 @@
 """
-ENG Arb Notifier — scans EPL, Championship, League One, League Two every 30 minutes
-Sends Telegram message when NEW arbs are found (filtered to Paddy/Betfair/Sky).
+ENG Arb Notifier — minute-by-minute runner with smart gating
+- Executes every minute BETWEEN RAPID_WINDOW_START_ISO and RAPID_WINDOW_END_ISO (in TIMEZONE)
+- Executes only on 30‑minute marks OUTSIDE that window
+- Scans EPL, Championship, League One, League Two, FA Cup, EFL Cup
 
-Env:
-- ODDS_API_KEY (required)
-- TELEGRAM_BOT_TOKEN (required)
-- TELEGRAM_CHAT_ID (required)
-- MIN_ROI_PCT (optional, default 0.2)
-- REGIONS (optional, default "uk,eu")
-- TEST_MODE (optional, "true" to send a quick hello)
+Env (set in workflow or repository secrets/variables):
+- ODDS_API_KEY (secret, required)
+- TELEGRAM_BOT_TOKEN (secret, required)
+- TELEGRAM_CHAT_ID (secret, required)
+- MIN_ROI_PCT (var, optional; default 0.2)
+- REGIONS (var, optional; default "uk,eu")
+- TIMEZONE (var, optional; default "Europe/Dublin")
+- RAPID_WINDOW_START_ISO (var, optional; ISO without TZ, e.g. "2025-08-16T12:00:00")
+- RAPID_WINDOW_END_ISO   (var, optional; ISO without TZ, e.g. "2025-08-16T17:00:00")
+- TEST_MODE (var, optional; "true" to send a test message immediately)
 """
 import os, sys, json, hashlib, requests
 from typing import Dict, List
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
 
 BASE_URL = "https://api.the-odds-api.com/v4"
 SPORTS = [
@@ -19,6 +29,8 @@ SPORTS = [
     ("Championship", "soccer_efl_championship"),
     ("League One", "soccer_england_league1"),
     ("League Two", "soccer_england_league2"),
+    ("FA Cup", "soccer_fa_cup"),
+    ("EFL Cup", "soccer_efl_cup"),
 ]
 
 TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
@@ -75,6 +87,34 @@ def telegram_send(token: str, chat_id: str, text: str):
                   json={"chat_id": chat_id, "text": text, "parse_mode":"HTML","disable_web_page_preview":True},
                   timeout=20).raise_for_status()
 
+def within_rapid_window(now_local, tzname: str, start_iso: str, end_iso: str) -> bool:
+    """Return True if now_local (timezone-aware) falls within [start, end)."""
+    if not (start_iso and end_iso and tzname and ZoneInfo):
+        return False
+    tz = ZoneInfo(tzname)
+    try:
+        start = datetime.fromisoformat(start_iso).replace(tzinfo=tz)
+        end = datetime.fromisoformat(end_iso).replace(tzinfo=tz)
+    except Exception:
+        return False
+    return start <= now_local < end
+
+def should_execute_now() -> bool:
+    """Minute-level gating:
+       - inside rapid window: run every minute
+       - outside: run only when minute % 30 == 0
+    """
+    tzname = os.environ.get("TIMEZONE", "Europe/Dublin")
+    tz = ZoneInfo(tzname) if ZoneInfo else None
+    now_local = datetime.now(tz) if tz else datetime.utcnow()
+    start_iso = os.environ.get("RAPID_WINDOW_START_ISO", "")
+    end_iso   = os.environ.get("RAPID_WINDOW_END_ISO", "")
+    in_window = within_rapid_window(now_local, tzname, start_iso, end_iso)
+    if in_window:
+        return True
+    # outside window: only run on 00 or 30 past the hour
+    return now_local.minute % 30 == 0
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -83,6 +123,11 @@ def main():
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr); sys.exit(1)
     if test_mode:
         telegram_send(token, chat_id, "✅ Test from ENG Arb Notifier — your Telegram is wired up."); print("Test sent."); return
+
+    # Smart gating
+    if not should_execute_now():
+        print("Skipping this minute per schedule gating."); return
+
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
         print("Missing ODDS_API_KEY", file=sys.stderr); sys.exit(1)
@@ -106,14 +151,13 @@ def main():
     if digest == prev: print("Arbs unchanged; not sending."); return
     with open(state_file,"w") as f: f.write(digest)
 
-    # Build message per league, cap total lines
     lines = ["<b>New ENG arbs found</b> (incl. Paddy/Betfair/Sky):"]
     count = 0
-    for league in ["EPL", "Championship", "League One", "League Two"]:
+    for league,_ in SPORTS:
         chunk = [a for a in all_arbs if a["league"] == league]
         if not chunk: continue
         lines.append(f"\n<b>{league}</b>")
-        for a in chunk[:5]:  # up to 5 per league
+        for a in chunk[:5]:
             lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%\n  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}")
             count += 1
             if count >= 12: break
