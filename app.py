@@ -1,17 +1,6 @@
 """
-EPL Arbitrage Finder (Surebet Scanner)
-Single‑file Streamlit app that compares bookmaker prices (via The Odds API)
-for English football (EPL by default) and flags cross‑book arbitrage.
-
-How to run locally:
-  1) pip install streamlit requests pandas python-dateutil
-  2) streamlit run app.py
-
-Notes:
-  • You need an API key from The Odds API (free tier available). Enter it in the sidebar.
-  • This tool only RECOMMENDS stake splits for potential surebets. It does NOT place bets.
-  • Always respect bookmaker & data‑provider terms. Odds move fast; refresh before acting.
-  • Gambling involves risk. Use limits and only bet what you can afford to lose.
+EPL Arbitrage Finder (Surebet Scanner) — Filtered
+Only shows arbs that involve at least one of: Paddy Power, Betfair, Sky Bet.
 """
 
 import math
@@ -23,14 +12,22 @@ import streamlit as st
 from dateutil import parser as dtparser
 
 # ------------------------------
+# Config: bookmaker filter
+# ------------------------------
+# We match by lowercase substring to be robust to provider naming variations
+# e.g., "Sky Bet", "SkyBet"; "Paddy Power", "PaddyPower"; "Betfair Exchange".
+TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
+
+def is_target_book(book_name: str) -> bool:
+    name = (book_name or "").lower()
+    return any(k in name for k in TARGET_BOOK_KEYWORDS)
+
+# ------------------------------
 # Utility
 # ------------------------------
 
 def implied_prob(decimal_odds: float, commission: float = 0.0) -> float:
-    """Return implied probability from decimal odds, adjusting for commission (e.g., exchange fee).
-    commission is expressed as a fraction (5% => 0.05). For sportsbooks, leave 0.
-    We adjust payout by (1 - commission) so the effective odds are odds * (1 - commission).
-    """
+    """Return implied probability from decimal odds, adjusting for commission (e.g., exchange fee)."""
     if decimal_odds <= 1e-9:
         return float("inf")
     effective_odds = decimal_odds * (1 - commission)
@@ -41,14 +38,7 @@ def implied_prob(decimal_odds: float, commission: float = 0.0) -> float:
 
 def stake_split_for_arbitrage(best_odds: List[Tuple[str, float, str]], bankroll: float, commission_map: Dict[str, float]) -> Tuple[pd.DataFrame, float, float]:
     """Compute proportional stakes for arbitrage across N outcomes using best odds list.
-
-    best_odds: List of tuples (outcome_key, decimal_odds, bookmaker).
-    bankroll: total money to distribute across outcomes.
-    commission_map: map bookmaker -> commission fraction (0..1). Missing defaults to 0.
-
-    Returns a DataFrame (outcome, odds, bookmaker, stake, payout) and (roi_pct, margin)
-    where margin = 1 - sum(implied_probs), roi_pct = (min(payout) - bankroll)/bankroll*100.
-    """
+    Returns a DataFrame and (roi_pct, margin)."""
     rows = []
     implieds = []
     for outcome, odds, book in best_odds:
@@ -58,13 +48,11 @@ def stake_split_for_arbitrage(best_odds: List[Tuple[str, float, str]], bankroll:
     total_ip = sum(implieds)
     margin = 1.0 - total_ip
 
-    stakes = []
     payouts = []
     for (outcome, odds, book), ip in zip(best_odds, implieds):
-        stake = bankroll * (ip / total_ip)
+        stake = bankroll * (ip / total_ip) if total_ip > 0 else 0.0
         c = commission_map.get(book, 0.0)
         payout = stake * odds * (1 - c)
-        stakes.append(stake)
         payouts.append(payout)
         rows.append({
             "Outcome": outcome,
@@ -121,7 +109,7 @@ def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[s
 # ------------------------------
 
 st.set_page_config(page_title="EPL Arbitrage Finder", page_icon="⚽", layout="wide")
-st.title("⚽ EPL Arbitrage Finder (Surebet Scanner)")
+st.title("⚽ EPL Arbitrage Finder (Surebet Scanner) — filtered to Paddy Power / Betfair / Sky Bet")
 
 with st.sidebar:
     st.header("Settings")
@@ -138,7 +126,7 @@ with st.sidebar:
         st.caption("Set commission per bookmaker/exchange (0–10%). Leave blank for 0%.")
 
     st.divider()
-    st.caption("Odds move quickly. Use the refresh button below before acting.")
+    st.caption("Filtering to arbs that include Paddy Power, Betfair, or Sky Bet.")
     refresh = st.button("🔄 Refresh odds")
 
 sport_key = SPORT_KEYS[sport_label]
@@ -181,16 +169,15 @@ for ev in events:
             if market.get("key") != market_key:
                 continue
             for outcome in market.get("outcomes", []):
-                name = outcome.get("name")  # usually home/draw/away names
+                name = outcome.get("name")
                 price = float(outcome.get("price"))
+                # save best price per named outcome
                 if name not in best or price > best[name][0]:
                     best[name] = (price, book_name)
 
     # Require complete 1X2 set (Home/Draw/Away) for arbitrage check
     if market_key == "h2h":
         needed = [home, "Draw", away]
-        # Map outcomes by attempting fuzzy match (some APIs use team names directly)
-        # Build a normalized mapping
         name_map = {}
         for k in list(best.keys()):
             low = k.lower()
@@ -208,23 +195,20 @@ for ev in events:
             ("Away", name_map[away][0], name_map[away][1]),
         ]
     else:
-        # For other markets, skip in this minimal demo
+        continue
+
+    # ---- NEW FILTER: require target bookmaker presence ----
+    books_in_arb = {b for (_, _, b) in best_triplet}
+    if not any(is_target_book(b) for b in books_in_arb):
         continue
 
     # Compute margin and ROI using commissions
-    implieds = [
-        implied_prob(o, commission_map.get(b, 0.0)) for (_, o, b) in best_triplet
-    ]
+    implieds = [implied_prob(o, commission_map.get(b, 0.0)) for (_, o, b) in best_triplet]
     total_ip = sum(implieds)
     margin = 1.0 - total_ip
-    if margin <= 0:
-        roi_est = 0.0
-    else:
-        # If you distribute bankroll proportionally, guaranteed ROI equals margin
-        roi_est = margin * 100.0
+    roi_est = max(margin * 100.0, 0.0)
 
     if roi_est >= min_roi:
-        # Compute stake plan for the bankroll
         plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_triplet, bankroll, commission_map)
         records.append({
             "Match": f"{home} vs {away}",
@@ -237,10 +221,11 @@ for ev in events:
         })
 
 # Display
-st.subheader("Results")
+st.subheader("Results (filtered)")
+
 
 if not records:
-    st.warning("No surebets found at the current thresholds. Try lowering the ROI filter or refreshing.")
+    st.info("No qualifying arbs found right now that include Paddy Power, Betfair, or Sky Bet. Try refreshing, widening regions, or lowering the ROI filter.")
 else:
     for rec in records:
         with st.expander(f"{rec['Match']} — Kickoff {rec['Kickoff']} — Margin {rec['Arb Margin %']}%"):
@@ -253,44 +238,26 @@ else:
                 st.metric("Best Away", rec["Best Away"].split(" @ ")[0], delta=None, help=rec["Best Away"].split(" @ ")[1])
             st.dataframe(rec["Plan"], use_container_width=True)
 
-# Download CSV of opportunities (flattened without the per‑match plan)
+# CSV summary
 if records:
-    flat = [
-        {
-            "Match": r["Match"],
-            "Kickoff": r["Kickoff"],
-            "Best Home": r["Best Home"],
-            "Best Draw": r["Best Draw"],
-            "Best Away": r["Best Away"],
-            "Arb Margin %": r["Arb Margin %"],
-        }
-        for r in records
-    ]
+    flat = [{
+        "Match": r["Match"],
+        "Kickoff": r["Kickoff"],
+        "Best Home": r["Best Home"],
+        "Best Draw": r["Best Draw"],
+        "Best Away": r["Best Away"],
+        "Arb Margin %": r["Arb Margin %"],
+    } for r in records]
     csv = pd.DataFrame(flat).to_csv(index=False).encode("utf-8")
-    st.download_button("Download summary CSV", data=csv, file_name="surebets_summary.csv", mime="text/csv")
+    st.download_button("Download summary CSV", data=csv, file_name="surebets_summary_filtered.csv", mime="text/csv")
 
 st.divider()
-with st.expander("How this works (math)"):
+with st.expander("About this filter"):
     st.markdown(
         """
-        For a 3‑way market (Home/Draw/Away) with decimal prices \\(O_H, O_D, O_A\\),
-        we compute **implied probabilities** as \\(p_i = 1 / (O_i \\times (1-\\text{commission}_i))\\).
-
-        If \\(p_H + p_D + p_A < 1\\) the market is *overbroke* and an arbitrage exists.
-        Stake each outcome proportionally to its implied probability:
-        \\(s_i = B \\cdot p_i / (p_H + p_D + p_A)\\), so every outcome returns approximately the same **net payout**.
-
-        The **arbitrage margin** is \\(1 - (p_H + p_D + p_A)\\), which equals the **guaranteed ROI** when staking as above (before slippage/limits).
-        """
-    )
-
-with st.expander("Limitations & Tips"):
-    st.markdown(
-        """
-        * Odds are snapshots and can change within seconds. Always refresh and double‑check inside the bookmaker app before placing bets.
-        * Minimum/maximum stake limits and account restrictions can kill arbs.
-        * This demo looks at 1X2 only. You can extend it to two‑way markets (e.g., Draw No Bet) or Asian handicaps.
-        * Commission inputs let you approximate exchange fees.
-        * Respect site ToS and your local laws.
+        This build **only** lists arbitrage opportunities where **at least one** of the best prices
+        comes from **Paddy Power**, **Betfair**, or **Sky Bet**.\n
+        The match is done using case-insensitive substring checks to catch provider variations like
+        *SkyBet*, *PaddyPower*, or *Betfair Exchange*.
         """
     )
