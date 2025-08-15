@@ -1,25 +1,16 @@
 """
-ENG Arb Notifier — minute-by-minute runner with smart gating
-- Executes every minute BETWEEN RAPID_WINDOW_START_ISO and RAPID_WINDOW_END_ISO (in TIMEZONE)
-- Executes only on 30‑minute marks OUTSIDE that window
-- Scans EPL, Championship, League One, League Two, FA Cup, EFL Cup
-
-Env (set in workflow or repository secrets/variables):
-- ODDS_API_KEY (secret, required)
-- TELEGRAM_BOT_TOKEN (secret, required)
-- TELEGRAM_CHAT_ID (secret, required)
-- MIN_ROI_PCT (var, optional; default 0.2)
-- REGIONS (var, optional; default "uk,eu")
-- TIMEZONE (var, optional; default "Europe/Dublin")
-- RAPID_WINDOW_START_ISO (var, optional; ISO without TZ, e.g. "2025-08-16T12:00:00")
-- RAPID_WINDOW_END_ISO   (var, optional; ISO without TZ, e.g. "2025-08-16T17:00:00")
-- TEST_MODE (var, optional; "true" to send a test message immediately)
+ENG Arb Notifier — betslip tuning
+Adds env controls:
+- CURRENCY (default "£")
+- STAKE_ROUND (default "0.05")
+- SHOW_EQUALIZED_PAYOUT (default "true")
+- BANKROLL (default "100")
 """
 import os, sys, json, hashlib, requests
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from datetime import datetime
 try:
-    from zoneinfo import ZoneInfo  # py3.9+
+    from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
@@ -32,7 +23,6 @@ SPORTS = [
     ("FA Cup", "soccer_fa_cup"),
     ("EFL Cup", "soccer_efl_cup"),
 ]
-
 TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
 
 def is_target_book(name: str) -> bool:
@@ -49,38 +39,66 @@ def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[s
     r.raise_for_status()
     return r.json()
 
-def compute_arbs_for_events(events: List[dict], min_roi_pct: float, commission_map: Dict[str, float], league_label: str) -> List[dict]:
+def best_triplet_from_event(ev: dict):
+    home, away = ev.get("home_team"), ev.get("away_team")
+    best = {}
+    for bk in ev.get("bookmakers", []):
+        book_name = bk.get("title") or bk.get("key")
+        for m in bk.get("markets", []):
+            if m.get("key") != "h2h": continue
+            for o in m.get("outcomes", []):
+                name, price = o.get("name"), float(o.get("price"))
+                if name not in best or price > best[name][0]: best[name] = (price, book_name)
+    name_map = {}
+    for k,v in best.items():
+        low = k.lower()
+        if "draw" in low: name_map["Draw"] = v
+        elif home and home.lower() in low: name_map["Home"] = v
+        elif away and away.lower() in low: name_map["Away"] = v
+    if not all(x in name_map for x in ["Home","Draw","Away"]): return None, []
+    return f"{home} vs {away}", [("Home",*name_map["Home"]),("Draw",*name_map["Draw"]),("Away",*name_map["Away"])]
+
+def round_stake(value: float, step: float) -> float:
+    if step <= 0: return round(value, 2)
+    return round(round(value / step) * step + 1e-9, 2)
+
+def format_money(x: float, symbol: str) -> str:
+    return f"{symbol}{x:,.2f}"
+
+def compute_arbs(events: List[dict], min_roi_pct: float, commission_map: Dict[str, float]) -> List[dict]:
     out = []
     for ev in events:
-        home, away = ev.get("home_team"), ev.get("away_team")
-        best = {}
-        for bk in ev.get("bookmakers", []):
-            book_name = bk.get("title") or bk.get("key")
-            for m in bk.get("markets", []):
-                if m.get("key") != "h2h": continue
-                for o in m.get("outcomes", []):
-                    name, price = o.get("name"), float(o.get("price"))
-                    if name not in best or price > best[name][0]: best[name] = (price, book_name)
-        name_map = {}
-        for k,v in best.items():
-            low = k.lower()
-            if "draw" in low: name_map["Draw"] = v
-            elif home and home.lower() in low: name_map["Home"] = v
-            elif away and away.lower() in low: name_map["Away"] = v
-        if not all(x in name_map for x in ["Home","Draw","Away"]): continue
-        triplet = [("Home",*name_map["Home"]),("Draw",*name_map["Draw"]),("Away",*name_map["Away"])]
+        match, triplet = best_triplet_from_event(ev)
+        if not triplet: continue
         if not any(is_target_book(b) for (_,_,b) in triplet): continue
         implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in triplet]
         margin = 1.0 - sum(implieds)
         roi = max(margin*100.0, 0.0)
         if roi >= min_roi_pct:
-            out.append({"league": league_label,
-                        "match": f"{home} vs {away}",
-                        "best_home": f"{triplet[0][1]} @ {triplet[0][2]}",
-                        "best_draw": f"{triplet[1][1]} @ {triplet[1][2]}",
-                        "best_away": f"{triplet[2][1]} @ {triplet[2][2]}",
-                        "roi_pct": round(roi,3)})
+            out.append({"match": match, "triplet": triplet, "roi_pct": round(roi,3)})
     return out
+
+def stake_plan(triplet, bankroll, commission_map, round_step):
+    implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in triplet]
+    tot = sum(implieds) or 1.0
+    plan, payouts = [], []
+    for (label, odds, book), ip in zip(triplet, implieds):
+        stake = bankroll * (ip / tot)
+        stake = round_stake(stake, round_step)
+        payout = stake * odds * (1 - commission_map.get(book,0.0))
+        payouts.append(payout)
+        plan.append((label, book, odds, stake))
+    eq = min(payouts) if payouts else 0.0
+    return plan, eq
+
+def build_betslip_text(league, match, roi_pct, bankroll, plan, currency_symbol, show_equalized, equalized_payout):
+    lines = [f"Betslip — {league}", f"{match}", f"Bankroll: {format_money(bankroll, currency_symbol)}  |  ROI≈ {roi_pct:.2f}%", "-"*44]
+    for label, book, odds, stake in plan:
+        lines.append(f"{label:<5} @ {book[:18]:<18}  {odds:<5}  {format_money(stake, currency_symbol)}")
+    if show_equalized:
+        lines.append("-"*44)
+        lines.append(f"Equalized payout (approx): {format_money(equalized_payout, currency_symbol)}")
+    return "\n".join(lines)
 
 def telegram_send(token: str, chat_id: str, text: str):
     requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
@@ -88,7 +106,6 @@ def telegram_send(token: str, chat_id: str, text: str):
                   timeout=20).raise_for_status()
 
 def within_rapid_window(now_local, tzname: str, start_iso: str, end_iso: str) -> bool:
-    """Return True if now_local (timezone-aware) falls within [start, end)."""
     if not (start_iso and end_iso and tzname and ZoneInfo):
         return False
     tz = ZoneInfo(tzname)
@@ -100,10 +117,6 @@ def within_rapid_window(now_local, tzname: str, start_iso: str, end_iso: str) ->
     return start <= now_local < end
 
 def should_execute_now() -> bool:
-    """Minute-level gating:
-       - inside rapid window: run every minute
-       - outside: run only when minute % 30 == 0
-    """
     tzname = os.environ.get("TIMEZONE", "Europe/Dublin")
     tz = ZoneInfo(tzname) if ZoneInfo else None
     now_local = datetime.now(tz) if tz else datetime.utcnow()
@@ -112,19 +125,21 @@ def should_execute_now() -> bool:
     in_window = within_rapid_window(now_local, tzname, start_iso, end_iso)
     if in_window:
         return True
-    # outside window: only run on 00 or 30 past the hour
     return now_local.minute % 30 == 0
 
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    bankroll = float(os.environ.get("BANKROLL", "100"))
+    currency = os.environ.get("CURRENCY", "£")
+    round_step = float(os.environ.get("STAKE_ROUND", "0.05"))
+    show_eq = os.environ.get("SHOW_EQUALIZED_PAYOUT", "true").lower() in ("1","true","yes")
     test_mode = os.environ.get("TEST_MODE","").lower() in ("1","true","yes")
     if not (token and chat_id):
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr); sys.exit(1)
     if test_mode:
         telegram_send(token, chat_id, "✅ Test from ENG Arb Notifier — your Telegram is wired up."); print("Test sent."); return
 
-    # Smart gating
     if not should_execute_now():
         print("Skipping this minute per schedule gating."); return
 
@@ -141,7 +156,9 @@ def main():
         except Exception as e:
             print(f"Fetch failed for {label}: {e}", file=sys.stderr)
             continue
-        all_arbs.extend(compute_arbs_for_events(events, min_roi, commission_map={}, league_label=label))
+        for a in compute_arbs(events, min_roi, commission_map={}):
+            a["league"] = label
+            all_arbs.append(a)
 
     if not all_arbs:
         print("No arbs this run."); return
@@ -151,17 +168,28 @@ def main():
     if digest == prev: print("Arbs unchanged; not sending."); return
     with open(state_file,"w") as f: f.write(digest)
 
+    # Build message; add betslips for ROI>5%
     lines = ["<b>New ENG arbs found</b> (incl. Paddy/Betfair/Sky):"]
+    betslip_blocks = []
     count = 0
     for league,_ in SPORTS:
         chunk = [a for a in all_arbs if a["league"] == league]
         if not chunk: continue
         lines.append(f"\n<b>{league}</b>")
         for a in chunk[:5]:
-            lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%\n  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}")
+            lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%")
+            lines.append(f"  H: {a['triplet'][0][1]} @ {a['triplet'][0][2]}")
+            lines.append(f"  D: {a['triplet'][1][1]} @ {a['triplet'][1][2]}")
+            lines.append(f"  A: {a['triplet'][2][1]} @ {a['triplet'][2][2]}")
             count += 1
-            if count >= 12: break
+            if a["roi_pct"] > 5.0 and len(betslip_blocks) < 3:
+                plan, equalized = stake_plan(a["triplet"], bankroll, commission_map={}, round_step=round_step)
+                betslip_text = build_betslip_text(league, a["match"], a["roi_pct"], bankroll, plan, currency, show_eq, equalized)
+                betslip_blocks.append(f"<pre>{betslip_text}</pre>")
         if count >= 12: break
+    if betslip_blocks:
+        lines.append("\n<b>High-ROI betslips (ROI>5%)</b>")
+        lines.extend(betslip_blocks)
 
     telegram_send(token, chat_id, "\n".join(lines))
     print(f"Sent {len(all_arbs)} arbs.")

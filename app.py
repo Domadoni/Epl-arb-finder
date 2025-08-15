@@ -1,14 +1,18 @@
 """
-English Football Arbitrage Finder — All competitions on one screen
-Covers: EPL, Championship, League One, League Two, FA Cup, EFL Cup
-- Multi-select competitions (default: all)
-- Combined results table with league labels
-- Per-match expanders with stake plans
-- Optional bookmaker filter (Paddy/Betfair/Sky)
-- Telegram alerts (session-based) + optional 30-min auto-refresh
+ENG Arbitrage — All competitions, with tunable betslip formatting
+New controls:
+- Currency symbol (e.g., £, €, $)
+- Stake rounding step (e.g., 0.01, 0.05, 0.10)
+- Odds decimal places (2–3 typical)
+- Show equalized payout line toggle
 """
-import math, time, hashlib, json
+import math, time, hashlib, json, urllib.parse
 from typing import Dict, List, Tuple
+from datetime import datetime
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 import pandas as pd
 import requests
@@ -30,9 +34,24 @@ DEFAULT_REGIONS = ["uk", "eu"]
 SUPPORTED_MARKETS = {"Match Result (1X2)": "h2h"}
 
 TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
+BOOKMAKER_BASELINKS = [
+    ("paddy power", "https://www.paddypower.com/"),
+    ("betfair", "https://www.betfair.com/exchange/plus/"),
+    ("sky bet", "https://m.skybet.com/"),
+    ("skybet", "https://m.skybet.com/"),
+]
+
 def is_target_book(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in TARGET_BOOK_KEYWORDS)
+
+def bookmaker_link(book_name: str, match_str: str) -> str:
+    name_l = (book_name or "").lower()
+    for key, url in BOOKMAKER_BASELINKS:
+        if key in name_l:
+            return url
+    q = urllib.parse.quote_plus(f"{book_name} {match_str}")
+    return f"https://www.google.com/search?q={q}"
 
 def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
     if not bot_token or not chat_id:
@@ -70,11 +89,42 @@ def stake_split_for_arbitrage(best_odds: List[Tuple[str, float, str]], bankroll:
         c = commission_map.get(book, 0.0)
         payout = stake * odds * (1 - c)
         payouts.append(payout)
-        rows.append({"Outcome": outcome, "Bookmaker": book, "Odds": round(odds,3), "Commission": f"{int(c*100)}%", "Stake": round(stake,2), "Net Payout if Wins": round(payout,2)})
+        rows.append({"Outcome": outcome, "Bookmaker": book, "Odds": round(odds,3), "Commission": f"{int(c*100)}%", "Stake": stake, "Net Payout if Wins": payout})
     min_payout = min(payouts) if payouts else 0.0
     roi_pct = ((min_payout - bankroll) / bankroll * 100.0) if bankroll else 0.0
     import pandas as pd
     return pd.DataFrame(rows), roi_pct, margin
+
+def round_stake(value: float, step: float) -> float:
+    if step <= 0: return round(value, 2)
+    return round(round(value / step) * step + 1e-9, 2)
+
+def format_money(x: float, symbol: str) -> str:
+    return f"{symbol}{x:,.2f}"
+
+def build_betslip_text(comp: str, match_str: str, kickoff: str, roi_pct: float, bankroll: float, plan_df: pd.DataFrame, currency_symbol: str, stake_step: float, odds_decimals: int, show_equalized: bool) -> str:
+    # Round stakes for the shareable slip
+    plan = plan_df.copy()
+    plan["Stake"] = plan["Stake"].apply(lambda v: round_stake(float(v), stake_step))
+    plan["Odds"] = plan["Odds"].apply(lambda v: round(float(v), odds_decimals))
+    # Compute equalized payout after rounding
+    if len(plan):
+        net_payouts = plan.apply(lambda r: float(r["Stake"]) * float(r["Odds"]) * (1 - (0 if isinstance(r["Commission"], str) else float(r["Commission"]))), axis=1) if False else plan["Net Payout if Wins"]
+        equalized = float(net_payouts.min()) if len(plan) else 0.0
+    else:
+        equalized = 0.0
+    lines = [
+        f"Betslip — {comp}",
+        f"{match_str} (KO {kickoff})",
+        f"Bankroll: {format_money(bankroll, currency_symbol)}  |  ROI≈ {roi_pct:.2f}%",
+        "-"*44
+    ]
+    for _, row in plan.iterrows():
+        lines.append(f"{row['Outcome']:<5} @ {row['Bookmaker'][:18]:<18}  {row['Odds']:<5}  {format_money(row['Stake'], currency_symbol)}")
+    if show_equalized and len(plan):
+        lines.append("-"*44)
+        lines.append(f"Equalized payout (approx): {format_money(equalized, currency_symbol)}")
+    return "\n".join(lines)
 
 @st.cache_data(ttl=60)
 def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[str]) -> List[dict]:
@@ -88,7 +138,13 @@ def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[s
 st.set_page_config(page_title="ENG Arb Finder — All comps", page_icon="⚽", layout="wide")
 st.title("⚽ English Football Arbitrage Finder — All competitions on one screen")
 
-# Auto-refresh every 30 minutes while page open
+# Timestamp (Europe/Dublin) for exports
+tzname = "Europe/Dublin"
+tz = ZoneInfo(tzname) if ZoneInfo else None
+fetched_at = (datetime.now(tz) if tz else datetime.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
+fetched_regions = None  # filled after sidebar
+
+# Auto-refresh every 30 minutes while page is open
 if "last_tick" not in st.session_state:
     st.session_state["last_tick"] = time.time()
 elif time.time() - st.session_state["last_tick"] > 30*60:
@@ -100,8 +156,13 @@ with st.sidebar:
     api_key = st.text_input("The Odds API key", type="password")
     comps = st.multiselect("Competitions", list(SPORT_KEYS.keys()), default=list(SPORT_KEYS.keys()))
     regions = st.multiselect("Regions (bookmaker regions)", ["uk","eu","us","au"], default=DEFAULT_REGIONS)
+    fetched_regions = ",".join(regions)
     market_label = st.selectbox("Market", list(SUPPORTED_MARKETS.keys()), index=0)
-    bankroll = st.number_input("Bankroll to allocate per bet (£)", min_value=0.0, value=100.0, step=10.0)
+    bankroll = st.number_input("Bankroll to allocate per bet", min_value=0.0, value=100.0, step=10.0)
+    currency_symbol = st.text_input("Currency symbol", value="£")
+    stake_step = st.selectbox("Stake rounding step", options=[0.01, 0.05, 0.10, 0.50, 1.00], index=1, format_func=lambda x: f"{x:.2f}")
+    odds_decimals = st.selectbox("Odds decimal places", options=[2,3], index=1)
+    show_equalized = st.checkbox("Include equalized payout line in betslip", value=True)
     min_roi = st.slider("Minimum ROI to show (percent)", min_value=-10.0, max_value=10.0, value=0.2, step=0.1)
     include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
@@ -189,15 +250,24 @@ for comp in comps:
 
         if roi_est >= min_roi:
             plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_triplet, bankroll, commission_map)
+            # Add link column to the per-outcome plan and format columns
+            match_str = f"{home} vs {away}"
+            plan_df["Stake"] = plan_df["Stake"].apply(lambda v: round_stake(float(v), stake_step))
+            plan_df["Odds"] = plan_df["Odds"].apply(lambda v: round(float(v), odds_decimals))
+            plan_df["Net Payout if Wins"] = plan_df["Net Payout if Wins"].apply(lambda v: round(float(v), 2))
+            links = [bookmaker_link(row["Bookmaker"], match_str) for _, row in plan_df.iterrows()]
+            plan_df.insert(len(plan_df.columns), "Bookmaker Link", links)
+
             all_records.append({
                 "Competition": comp,
-                "Match": f"{home} vs {away}",
+                "Match": match_str,
                 "Kickoff": commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else "",
                 "Best Home": f"{best_triplet[0][1]} @ {best_triplet[0][2]}",
                 "Best Draw": f"{best_triplet[1][1]} @ {best_triplet[1][2]}",
                 "Best Away": f"{best_triplet[2][1]} @ {best_triplet[2][2]}",
                 "Arb Margin %": round(margin2*100, 3),
                 "Plan": plan_df,
+                "BetslipText": build_betslip_text(comp, match_str, (commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else ""), roi_pct, bankroll, plan_df, currency_symbol, stake_step, odds_decimals, show_equalized),
             })
 
 # Display any fetch errors
@@ -236,10 +306,13 @@ else:
                 with c2: st.metric("Best Draw", rec["Best Draw"].split(" @ ")[0], help=rec["Best Draw"].split(" @ ")[1])
                 with c3: st.metric("Best Away", rec["Best Away"].split(" @ ")[0], help=rec["Best Away"].split(" @ ")[1])
                 st.dataframe(rec["Plan"], use_container_width=True)
+                st.caption("Copy as betslip")
+                st.code(rec["BetslipText"])
 
-# Download CSV of opportunities
+# CSV downloads with timestamp/regions + links (as before)
 if all_records:
-    flat = [{
+    # Summary
+    summary_rows = [{
         "Competition": r["Competition"],
         "Match": r["Match"],
         "Kickoff": r["Kickoff"],
@@ -247,35 +320,27 @@ if all_records:
         "Best Draw": r["Best Draw"],
         "Best Away": r["Best Away"],
         "Arb Margin %": r["Arb Margin %"],
+        "Fetched At (Europe/Dublin)": fetched_at,
+        "Regions": fetched_regions,
     } for r in all_records]
-    csv = pd.DataFrame(flat).to_csv(index=False).encode("utf-8")
-    st.download_button("Download summary CSV", data=csv, file_name="surebets_summary_all_competitions.csv", mime="text/csv")
+    export_summary_df = pd.DataFrame(summary_rows).sort_values(["Competition", "Kickoff", "Match"])
 
-# Session-based Telegram notification for NEW arbs
-arb_summaries = [{
-    "comp": r["Competition"],
-    "match": r["Match"],
-    "best_home": r["Best Home"],
-    "best_draw": r["Best Draw"],
-    "best_away": r["Best Away"],
-    "margin_pct": r["Arb Margin %"],
-} for r in all_records]
-curr_digest = hash_arbs_summary(arb_summaries)
-prev_digest = st.session_state.get("last_arb_digest")
+    # Detailed
+    detailed_rows = []
+    for r in all_records:
+        plan_df = r["Plan"].copy()
+        plan_df.insert(0, "Competition", r["Competition"])
+        plan_df.insert(1, "Match", r["Match"])
+        plan_df.insert(2, "Kickoff", r["Kickoff"])
+        plan_df["Arb Margin %"] = r["Arb Margin %"]
+        plan_df["Fetched At (Europe/Dublin)"] = fetched_at
+        plan_df["Regions"] = fetched_regions
+        detailed_rows.append(plan_df)
 
-if 'notify_live' in locals() and notify_live and arb_summaries and curr_digest != prev_digest:
-    lines = ["<b>New arbs found</b> across selected competitions" + (" (incl. Paddy/Betfair/Sky)" if filter_to_target else "")]
-    # group by comp
-    comps_in_results = sorted(set(a["comp"] for a in arb_summaries))
-    for comp in comps_in_results:
-        lines.append(f"\n<b>{comp}</b>")
-        chunk = [a for a in arb_summaries if a["comp"] == comp][:5]
-        for a in chunk:
-            lines.append(
-                f"• {a['match']} — Margin ~ {a['margin_pct']}%\n"
-                f"  H: {a['best_home']}\n  D: {a['best_draw']}\n  A: {a['best_away']}"
-            )
-    telegram_send(bot_token, chat_id, "\n".join(lines))
-    st.toast("Sent Telegram alert for new arbs ✅", icon="✅")
+    export_detailed_df = pd.concat(detailed_rows, ignore_index=True) if detailed_rows else pd.DataFrame()
+    if not export_detailed_df.empty:
+        cols = ["Competition","Match","Kickoff","Arb Margin %","Outcome","Bookmaker","Bookmaker Link","Odds","Commission","Stake","Net Payout if Wins","Fetched At (Europe/Dublin)","Regions"]
+        export_detailed_df = export_detailed_df[cols]
 
-st.session_state["last_arb_digest"] = curr_digest
+    st.download_button("⬇️ Download summary CSV", data=export_summary_df.to_csv(index=False).encode("utf-8"), file_name="surebets_summary_all_competitions.csv", mime="text/csv")
+    st.download_button("⬇️ Download detailed CSV (per outcome + stakes + links)", data=export_detailed_df.to_csv(index=False).encode("utf-8"), file_name="surebets_detailed_all_competitions.csv", mime="text/csv")
