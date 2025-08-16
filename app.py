@@ -198,26 +198,6 @@ with st.sidebar:
     show_debug = st.checkbox("Show raw market keys (debug)", value=False)
 
     commission_map: Dict[str, float] = {}
-    if include_commission:
-        st.caption("Set commission per bookmaker/exchange (0–10%). Leave blank for 0%.")
-
-    st.divider()
-    st.caption("Odds move quickly. Use the refresh button below before acting.")
-    st.button("🔄 Refresh odds")
-
-    st.subheader("🔔 Telegram alerts (optional)")
-    tg_bot_token_default = st.secrets.get("telegram", {}).get("bot_token", "") if "telegram" in st.secrets else ""
-    tg_chat_id_default = st.secrets.get("telegram", {}).get("chat_id", "") if "telegram" in st.secrets else ""
-    bot_token = st.text_input("Bot token", value=tg_bot_token_default, type="password", help="Create via @BotFather")
-    chat_id = st.text_input("Chat ID", value=tg_chat_id_default, help="Your user or group chat id")
-    notify_live = st.checkbox("Notify when new arbs appear", value=False)
-    if st.button("Send test"):
-        try:
-            requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
-                          json={"chat_id": chat_id, "text": "✅ Test from ENG Arb Finder", "parse_mode":"HTML"}, timeout=15).raise_for_status()
-            st.success("Test sent (check Telegram).")
-        except Exception as e:
-            st.warning(f"Telegram send failed: {e}")
 
 if not api_key:
     st.info("Enter your API key in the sidebar to fetch live odds."); st.stop()
