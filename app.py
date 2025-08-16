@@ -17,6 +17,19 @@ except Exception:
 import pandas as pd
 import requests
 import streamlit as st
+import requests
+
+def telegram_send(bot_token: str, chat_id: str, text: str):
+    """Send a Telegram message to the given chat_id."""
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+    except Exception as e:
+        st.error(f"Telegram send failed: {e}")
+
 from dateutil import parser as dtparser
 
 BASE_URL = "https://api.the-odds-api.com/v4"
