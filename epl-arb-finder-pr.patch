@@ -1,0 +1,284 @@
+From 3f6e7d2a1c9b2e34567890123456789012345678 Mon Sep 17 00:00:00 2001
+From: ChatGPT <devnull@example.com>
+Date: Sat, 16 Aug 2025 09:15:00 +0100
+Subject: [PATCH] feat(app): multi-competition view, CSV export, configurable
+ Telegram share block, and cadence gating
+
+This patch adds:
+- League One & League Two support and a single-screen multi-select.
+- CSV export of all identified arbs.
+- Shareable Telegram betslip text for arbs above a configurable ROI%.
+- Sidebar settings for currency, stake rounding, odds decimals, and equalized payout.
+- Simple notification cadence: minutely inside a chosen window, otherwise every 30 mins.
+
+Assumptions:
+- Repo has app.py, notifier.py, README.md.
+- Existing functions fetch_odds() and find_arbs() return a tidy DataFrame.
+- Arb DataFrame columns include: home_team, away_team, market, book_a, book_b,
+  odds_a, odds_b, stake_a, stake_b, roi (and optionally payout_equalized).
+---
+ diff --git a/app.py b/app.py
+index 1111111..2222222 100644
+--- a/app.py
++++ b/app.py
+@@ -1,24 +1,92 @@
+-import streamlit as st
+-from notifier import run_notifier
++import streamlit as st
++from notifier import run_notifier
++import pandas as pd
++from datetime import datetime, date, time, timedelta
++import pytz
+ 
+-st.set_page_config(page_title="ENG Arbitrage Finder", layout="wide")
++DEFAULT_BANKROLL = 100
++DEFAULT_CURRENCY = "£"
++DEFAULT_STAKE_ROUND = 0.05     # round to nearest 5p
++DEFAULT_DECIMALS = 2
++DEFAULT_SHOW_EQUALIZED = True
++DEFAULT_MIN_ROI_NOTIFY = 5.0   # %
++
++st.set_page_config(page_title="ENG Arbitrage Finder", layout="wide")
+ 
+ st.title("ENG Arbitrage Finder")
+-st.caption("English football arbs between selected bookmakers, with Telegram notifications.")
++st.caption("English football arbs between selected bookmakers, with Telegram notifications.")
+ 
+-# Competition selection (previously single screen per comp)
+-competition = st.selectbox("Competition", ["Premier League", "Championship"])
++# --- Sidebar controls ---
++with st.sidebar:
++    st.subheader("Settings")
++    currency = st.text_input("Currency symbol", value=DEFAULT_CURRENCY)
++    bankroll = st.number_input("Bankroll", min_value=1.0, value=float(DEFAULT_BANKROLL), step=10.0)
++    stake_round = st.number_input("Stake rounding step", min_value=0.01, value=float(DEFAULT_STAKE_ROUND), step=0.01, help="e.g., £0.05")
++    odds_decimals = st.selectbox("Odds decimals", options=[2,3], index=0)
++    show_equalized = st.toggle("Include equalized payout line", value=DEFAULT_SHOW_EQUALIZED)
++    min_roi_notify = st.number_input("Min ROI% for Telegram share block", min_value=0.0, value=DEFAULT_MIN_ROI_NOTIFY, step=0.5)
++    telegram_token = st.text_input("Telegram bot token", type="password", help="Enter here (stored only in session).")
++    telegram_chat_id = st.text_input("Telegram chat ID", help="Your user or group/chat id.")
++
++    st.markdown(\"---\")
++    st.subheader("Notification cadence")
++    local_tz = pytz.timezone("Europe/Dublin")
++    tomorrow = date.today() + timedelta(days=1)
++    window_start = st.time_input("High-frequency start", value=time(12,0))
++    window_end = st.time_input("High-frequency end", value=time(17,0))
++    high_freq_minutes = st.number_input("High-frequency interval (minutes)", min_value=1, value=1)
++    low_freq_minutes = st.number_input("Low-frequency interval (minutes)", min_value=1, value=30)
++    target_day = st.date_input("Day for high-frequency window", value=tomorrow)
++
++    st.markdown(\"---\")
++    st.subheader("Run")
++    run_scan = st.button("Scan now")
+ 
+-# Bookmakers / filters (placeholder if you already had them)
+-# ...
++st.markdown("### Competitions")
++competitions = st.multiselect(
++    "Choose one or more competitions",
++    ["Premier League", "Championship", "League One", "League Two"],
++    default=["Premier League", "Championship", "League One", "League Two"],
++)
+ 
+-# Run notifier / scan
+-if st.button("Scan"):
+-    results_df = run_notifier(competition=competition)
+-    st.dataframe(results_df)
++results_df = pd.DataFrame()
++if run_scan:
++    results_df = run_notifier(
++        competitions=competitions,
++        bankroll=bankroll,
++        currency=currency,
++        stake_round=stake_round,
++        odds_decimals=odds_decimals,
++        show_equalized=show_equalized,
++        min_roi_share=min_roi_notify,
++        telegram_token=telegram_token or None,
++        telegram_chat_id=telegram_chat_id or None,
++        schedule={
++            "tz": "Europe/Dublin",
++            "target_day": str(target_day),
++            "window_start": window_start.strftime("%H:%M"),
++            "window_end": window_end.strftime("%H:%M"),
++            "high_freq_minutes": int(high_freq_minutes),
++            "low_freq_minutes": int(low_freq_minutes),
++        },
++    )
++    if results_df is not None and len(results_df):
++        st.success(f"Found {len(results_df)} arb(s).")
++        st.dataframe(results_df, use_container_width=True)
++    else:
++        st.info("No arbs found this scan.")
+ 
+-# TODO: export
++# --- CSV Export ---
++if results_df is not None and len(results_df):
++    csv_bytes = results_df.to_csv(index=False).encode("utf-8")
++    st.download_button(
++        "⬇️ Download all arbs as CSV",
++        data=csv_bytes,
++        file_name="arbs.csv",
++        mime="text/csv"
++    )
+ 
+ diff --git a/notifier.py b/notifier.py
+index 3333333..4444444 100644
+--- a/notifier.py
++++ b/notifier.py
+@@ -1,32 +1,119 @@
+-import requests
+-from typing import List
++import requests
++from typing import List, Dict, Any, Tuple
++from datetime import datetime, date, time, timedelta
++import pytz
++import math
++import pandas as pd
+ 
+-# Existing: find_arbs(), fetch_odds(), etc.
++# --- Your existing helpers here ---
++# def fetch_odds(competitions: List[str]) -> pd.DataFrame: ...
++# def find_arbs(odds_df: pd.DataFrame) -> pd.DataFrame: ...
+ 
+-def send_telegram(token: str, chat_id: str, text: str):
++def send_telegram(token: str, chat_id: str, text: str):
+     if not token or not chat_id:
+         return
+     url = f"https://api.telegram.org/bot{token}/sendMessage"
+     requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+ 
++def _round_to_step(x: float, step: float) -> float:
++    return round(round(x / step) * step + 1e-9, 2)
++
++def _fmt_betslip(row: pd.Series, currency: str, bankroll: float, stake_round: float,
++                 odds_decimals: int, show_equalized: bool) -> str:
++    \"\"\"Builds a shareable betslip-style block for a single arb row.
++       Expected row columns (example): home_team, away_team, market, book_a, book_b,
++       odds_a, odds_b, stake_a, stake_b, roi, payout_equalized
++    \"\"\"
++    event = f\"{row.get('home_team','?')} vs {row.get('away_team','?')}\"
++    market = row.get('market', '1X2')
++    book_a = row.get('book_a','A')
++    book_b = row.get('book_b','B')
++    oa = float(row.get('odds_a', 0))
++    ob = float(row.get('odds_b', 0))
++    sa = _round_to_step(float(row.get('stake_a', 0)), stake_round)
++    sb = _round_to_step(float(row.get('stake_b', 0)), stake_round)
++    roi = float(row.get('roi', 0))
++    payout_eq = float(row.get('payout_equalized', 0.0))
++
++    fmt = f\"{{:.{odds_decimals}f}}\"
++    lines = []
++    lines.append(\"🔁 <b>Arb Opportunity</b>\")
++    lines.append(f\"Match: {event} • Market: {market}\")
++    lines.append(f\"{book_a}: Odds {fmt.format(oa)} — Stake {currency}{sa}\")
++    lines.append(f\"{book_b}: Odds {fmt.format(ob)} — Stake {currency}{sb}\")
++    lines.append(f\"ROI: {roi:.2f}%\")
++    if show_equalized and payout_eq > 0:
++        lines.append(f\"Equalized Payout: {currency}{payout_eq:.2f}\")
++    return \"\\n\".join(lines)
++
++def _within_window(now: datetime, target_day: date, start_hm: Tuple[int,int], end_hm: Tuple[int,int]) -> bool:
++    return now.date() == target_day and (time(*start_hm) <= now.time() <= time(*end_hm))
++
+ def run_notifier(
+-    competition: str,
++    competitions: List[str],
++    bankroll: float,
++    currency: str,
++    stake_round: float,
++    odds_decimals: int,
++    show_equalized: bool,
++    min_roi_share: float,
++    telegram_token: str | None,
++    telegram_chat_id: str | None,
++    schedule: Dict[str, Any] | None = None,
+ ) -> "pd.DataFrame":
+-    \"\"\"Fetch, compute arbs for one competition, optionally send Telegram.\"\"\"
+-    odds = fetch_odds([competition])
+-    arbs = find_arbs(odds)
+-    # If Telegram enabled, send summaries...
+-    return arbs
++    \"\"\"
++    Fetch odds for selected competitions, compute arbs, optionally notify via Telegram,
++    and return a DataFrame (for UI and CSV export).
++    \"\"\"
++    # 1) Fetch & compute
++    odds = fetch_odds(competitions)
++    arbs = find_arbs(odds)
++    if arbs is None or len(arbs) == 0:
++        return arbs
++
++    # 2) Build & send Telegram (only for rows passing min ROI threshold)
++    if telegram_token and telegram_chat_id:
++        shareable = []
++        for _, row in arbs.iterrows():
++            if float(row.get(\"roi\", 0)) >= float(min_roi_share):
++                shareable.append(
++                    _fmt_betslip(
++                        row,
++                        currency=currency,
++                        bankroll=bankroll,
++                        stake_round=stake_round,
++                        odds_decimals=odds_decimals,
++                        show_equalized=show_equalized,
++                    )
++                )
++        if shareable:
++            msg = \"\\n\\n\".join(shareable)
++            # Optional: gate messages by schedule cadence
++            if schedule:
++                tz = pytz.timezone(schedule.get(\"tz\",\"Europe/Dublin\"))
++                now = datetime.now(tz)
++                tgt = date.fromisoformat(schedule.get(\"target_day\"))
++                sh, sm = map(int, schedule.get(\"window_start\",\"12:00\").split(\":\"))
++                eh, em = map(int, schedule.get(\"window_end\",\"17:00\").split(\":\"))
++                hi = int(schedule.get(\"high_freq_minutes\", 1))
++                lo = int(schedule.get(\"low_freq_minutes\", 30))
++                in_window = _within_window(now, tgt, (sh, sm), (eh, em))
++                # Simple cadence: only send when minute % interval == 0
++                interval = hi if in_window else lo
++                if now.minute % interval == 0:
++                    send_telegram(telegram_token, telegram_chat_id, msg)
++            else:
++                send_telegram(telegram_token, telegram_chat_id, msg)
++
++    # 3) Return DataFrame for the UI (enables CSV export)
++    return arbs
+ 
+ diff --git a/README.md b/README.md
+index 5555555..6666666 100644
+--- a/README.md
++++ b/README.md
+@@ -1,12 +1,28 @@
+-# ENG Arbitrage — Tuned betslip formatting
++# ENG Arbitrage — Multi-competition, CSV export, and shareable Telegram betslips
+ 
+-UI controls
++## UI controls
+   * Currency symbol
+   * Stake rounding step (e.g., £0.05)
+   * Odds decimals (2 or 3)
+   * Toggle to include an Equalized payout line
++  * Multi-select competitions: Premier League, Championship, League One, League Two
++  * CSV export button for all arbs
++  * Notification cadence: minutely 12:00–17:00 on a chosen day, otherwise every 30 mins
+ 
+-Notifier variables
++## Notifier variables
+   * `BANKROLL` (default `100`)
+   * `CURRENCY` (default `£`)
+   * `STAKE_ROUND` (default `0.05`)
+   * `SHOW_EQUALIZED_PAYOUT` (default `true`)
++  * `MIN_ROI_SHARE` (default `5.0`) — only arbs at/above this include a shareable betslip block
+ 
+ The notifier still adds betslip blocks for arbs with ROI > 5% and respects your minutely time window gating.
+ 
++## Run locally
++```bash
++pip install -r requirements.txt
++streamlit run app.py
++```
++
