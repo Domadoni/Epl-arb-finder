@@ -1,198 +1,98 @@
-"""
-ENG Arb Notifier — betslip tuning
-Adds env controls:
-- CURRENCY (default "£")
-- STAKE_ROUND (default "0.05")
-- SHOW_EQUALIZED_PAYOUT (default "true")
-- BANKROLL (default "100")
-"""
-import os, sys, json, hashlib, requests
-from typing import Dict, List, Tuple
-from datetime import datetime
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+import requests
+from typing import List, Dict, Any, Tuple
+from datetime import datetime, date, time, timedelta
+import pytz
+import math
+import pandas as pd
 
-BASE_URL = "https://api.the-odds-api.com/v4"
-SPORTS = [
-    ("EPL", "soccer_epl"),
-    ("Championship", "soccer_efl_championship"),
-    ("League One", "soccer_england_league1"),
-    ("League Two", "soccer_england_league2"),
-    ("FA Cup", "soccer_fa_cup"),
-    ("EFL Cup", "soccer_efl_cup"),
-]
-TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
+# --- Your existing helpers here ---
+# def fetch_odds(competitions: List[str]) -> pd.DataFrame: ...
+# def find_arbs(odds_df: pd.DataFrame) -> pd.DataFrame: ...
 
-def is_target_book(name: str) -> bool:
-    n = (name or "").lower()
-    return any(k in n for k in TARGET_BOOK_KEYWORDS)
+def send_telegram(token: str, chat_id: str, text: str):
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
 
-def implied_prob(odds: float, commission: float = 0.0) -> float:
-    eff = odds * (1 - commission)
-    return 1.0/eff if eff>0 else 1e9
+def _round_to_step(x: float, step: float) -> float:
+    return round(round(x / step) * step + 1e-9, 2)
 
-def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[str]) -> List[dict]:
-    url = f"{BASE_URL}/sports/{sport_key}/odds"
-    r = requests.get(url, params={"apiKey": api_key, "regions": ",".join(regions), "markets": ",".join(markets), "oddsFormat":"decimal"}, timeout=20)
-    r.raise_for_status()
-    return r.json()
+def _fmt_betslip(row: pd.Series, currency: str, bankroll: float, stake_round: float,
+                 odds_decimals: int, show_equalized: bool) -> str:
+    """Builds a shareable betslip-style block for a single arb row."""
+    event = f"{row.get('home_team','?')} vs {row.get('away_team','?')}"
+    market = row.get('market', '1X2')
+    book_a = row.get('book_a','A')
+    book_b = row.get('book_b','B')
+    oa = float(row.get('odds_a', 0))
+    ob = float(row.get('odds_b', 0))
+    sa = _round_to_step(float(row.get('stake_a', 0)), stake_round)
+    sb = _round_to_step(float(row.get('stake_b', 0)), stake_round)
+    roi = float(row.get('roi', 0))
+    payout_eq = float(row.get('payout_equalized', 0.0))
 
-def best_triplet_from_event(ev: dict):
-    home, away = ev.get("home_team"), ev.get("away_team")
-    best = {}
-    for bk in ev.get("bookmakers", []):
-        book_name = bk.get("title") or bk.get("key")
-        for m in bk.get("markets", []):
-            if m.get("key") != "h2h": continue
-            for o in m.get("outcomes", []):
-                name, price = o.get("name"), float(o.get("price"))
-                if name not in best or price > best[name][0]: best[name] = (price, book_name)
-    name_map = {}
-    for k,v in best.items():
-        low = k.lower()
-        if "draw" in low: name_map["Draw"] = v
-        elif home and home.lower() in low: name_map["Home"] = v
-        elif away and away.lower() in low: name_map["Away"] = v
-    if not all(x in name_map for x in ["Home","Draw","Away"]): return None, []
-    return f"{home} vs {away}", [("Home",*name_map["Home"]),("Draw",*name_map["Draw"]),("Away",*name_map["Away"])]
-
-def round_stake(value: float, step: float) -> float:
-    if step <= 0: return round(value, 2)
-    return round(round(value / step) * step + 1e-9, 2)
-
-def format_money(x: float, symbol: str) -> str:
-    return f"{symbol}{x:,.2f}"
-
-def compute_arbs(events: List[dict], min_roi_pct: float, commission_map: Dict[str, float]) -> List[dict]:
-    out = []
-    for ev in events:
-        match, triplet = best_triplet_from_event(ev)
-        if not triplet: continue
-        if not any(is_target_book(b) for (_,_,b) in triplet): continue
-        implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in triplet]
-        margin = 1.0 - sum(implieds)
-        roi = max(margin*100.0, 0.0)
-        if roi >= min_roi_pct:
-            out.append({"match": match, "triplet": triplet, "roi_pct": round(roi,3)})
-    return out
-
-def stake_plan(triplet, bankroll, commission_map, round_step):
-    implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in triplet]
-    tot = sum(implieds) or 1.0
-    plan, payouts = [], []
-    for (label, odds, book), ip in zip(triplet, implieds):
-        stake = bankroll * (ip / tot)
-        stake = round_stake(stake, round_step)
-        payout = stake * odds * (1 - commission_map.get(book,0.0))
-        payouts.append(payout)
-        plan.append((label, book, odds, stake))
-    eq = min(payouts) if payouts else 0.0
-    return plan, eq
-
-def build_betslip_text(league, match, roi_pct, bankroll, plan, currency_symbol, show_equalized, equalized_payout):
-    lines = [f"Betslip — {league}", f"{match}", f"Bankroll: {format_money(bankroll, currency_symbol)}  |  ROI≈ {roi_pct:.2f}%", "-"*44]
-    for label, book, odds, stake in plan:
-        lines.append(f"{label:<5} @ {book[:18]:<18}  {odds:<5}  {format_money(stake, currency_symbol)}")
-    if show_equalized:
-        lines.append("-"*44)
-        lines.append(f"Equalized payout (approx): {format_money(equalized_payout, currency_symbol)}")
+    fmt = f"{{:.{odds_decimals}f}}"
+    lines = []
+    lines.append("🔁 <b>Arb Opportunity</b>")
+    lines.append(f"Match: {event} • Market: {market}")
+    lines.append(f"{book_a}: Odds {fmt.format(oa)} — Stake {currency}{sa}")
+    lines.append(f"{book_b}: Odds {fmt.format(ob)} — Stake {currency}{sb}")
+    lines.append(f"ROI: {roi:.2f}%")
+    if show_equalized and payout_eq > 0:
+        lines.append(f"Equalized Payout: {currency}{payout_eq:.2f}")
     return "\n".join(lines)
 
-def telegram_send(token: str, chat_id: str, text: str):
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  json={"chat_id": chat_id, "text": text, "parse_mode":"HTML","disable_web_page_preview":True},
-                  timeout=20).raise_for_status()
+def _within_window(now: datetime, target_day: date, start_hm: Tuple[int,int], end_hm: Tuple[int,int]) -> bool:
+    return now.date() == target_day and (time(*start_hm) <= now.time() <= time(*end_hm))
 
-def within_rapid_window(now_local, tzname: str, start_iso: str, end_iso: str) -> bool:
-    if not (start_iso and end_iso and tzname and ZoneInfo):
-        return False
-    tz = ZoneInfo(tzname)
-    try:
-        start = datetime.fromisoformat(start_iso).replace(tzinfo=tz)
-        end = datetime.fromisoformat(end_iso).replace(tzinfo=tz)
-    except Exception:
-        return False
-    return start <= now_local < end
+def run_notifier(
+    competitions: List[str],
+    bankroll: float,
+    currency: str,
+    stake_round: float,
+    odds_decimals: int,
+    show_equalized: bool,
+    min_roi_share: float,
+    telegram_token: str | None,
+    telegram_chat_id: str | None,
+    schedule: Dict[str, Any] | None = None,
+) -> "pd.DataFrame":
+    """Fetch odds for selected competitions, compute arbs, notify via Telegram, and return DataFrame."""
+    odds = fetch_odds(competitions)
+    arbs = find_arbs(odds)
+    if arbs is None or len(arbs) == 0:
+        return arbs
 
-def should_execute_now() -> bool:
-    tzname = os.environ.get("TIMEZONE", "Europe/Dublin")
-    tz = ZoneInfo(tzname) if ZoneInfo else None
-    now_local = datetime.now(tz) if tz else datetime.utcnow()
-    start_iso = os.environ.get("RAPID_WINDOW_START_ISO", "")
-    end_iso   = os.environ.get("RAPID_WINDOW_END_ISO", "")
-    in_window = within_rapid_window(now_local, tzname, start_iso, end_iso)
-    if in_window:
-        return True
-    return now_local.minute % 30 == 0
+    if telegram_token and telegram_chat_id:
+        shareable = []
+        for _, row in arbs.iterrows():
+            if float(row.get("roi", 0)) >= float(min_roi_share):
+                shareable.append(
+                    _fmt_betslip(
+                        row,
+                        currency=currency,
+                        bankroll=bankroll,
+                        stake_round=stake_round,
+                        odds_decimals=odds_decimals,
+                        show_equalized=show_equalized,
+                    )
+                )
+        if shareable:
+            msg = "\n\n".join(shareable)
+            if schedule:
+                tz = pytz.timezone(schedule.get("tz","Europe/Dublin"))
+                now = datetime.now(tz)
+                tgt = date.fromisoformat(schedule.get("target_day"))
+                sh, sm = map(int, schedule.get("window_start","12:00").split(":"))
+                eh, em = map(int, schedule.get("window_end","17:00").split(":"))
+                hi = int(schedule.get("high_freq_minutes", 1))
+                lo = int(schedule.get("low_freq_minutes", 30))
+                in_window = _within_window(now, tgt, (sh, sm), (eh, em))
+                interval = hi if in_window else lo
+                if now.minute % interval == 0:
+                    send_telegram(telegram_token, telegram_chat_id, msg)
+            else:
+                send_telegram(telegram_token, telegram_chat_id, msg)
 
-def main():
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    bankroll = float(os.environ.get("BANKROLL", "100"))
-    currency = os.environ.get("CURRENCY", "£")
-    round_step = float(os.environ.get("STAKE_ROUND", "0.05"))
-    show_eq = os.environ.get("SHOW_EQUALIZED_PAYOUT", "true").lower() in ("1","true","yes")
-    test_mode = os.environ.get("TEST_MODE","").lower() in ("1","true","yes")
-    if not (token and chat_id):
-        print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr); sys.exit(1)
-    if test_mode:
-        telegram_send(token, chat_id, "✅ Test from ENG Arb Notifier — your Telegram is wired up."); print("Test sent."); return
-
-    if not should_execute_now():
-        print("Skipping this minute per schedule gating."); return
-
-    api_key = os.environ.get("ODDS_API_KEY")
-    if not api_key:
-        print("Missing ODDS_API_KEY", file=sys.stderr); sys.exit(1)
-    min_roi = float(os.environ.get("MIN_ROI_PCT","0.2"))
-    regions = [x.strip() for x in os.environ.get("REGIONS","uk,eu").split(",") if x.strip()]
-
-    all_arbs = []
-    for (label, sport_key) in SPORTS:
-        try:
-            events = fetch_odds(api_key, sport_key, regions, ["h2h"])
-        except Exception as e:
-            print(f"Fetch failed for {label}: {e}", file=sys.stderr)
-            continue
-        for a in compute_arbs(events, min_roi, commission_map={}):
-            a["league"] = label
-            all_arbs.append(a)
-
-    if not all_arbs:
-        print("No arbs this run."); return
-
-    digest = hashlib.sha256(json.dumps(all_arbs, sort_keys=True).encode("utf-8")).hexdigest()
-    state_file = ".arb_state_hash"; prev = open(state_file).read().strip() if os.path.exists(state_file) else None
-    if digest == prev: print("Arbs unchanged; not sending."); return
-    with open(state_file,"w") as f: f.write(digest)
-
-    # Build message; add betslips for ROI>5%
-    lines = ["<b>New ENG arbs found</b> (incl. Paddy/Betfair/Sky):"]
-    betslip_blocks = []
-    count = 0
-    for league,_ in SPORTS:
-        chunk = [a for a in all_arbs if a["league"] == league]
-        if not chunk: continue
-        lines.append(f"\n<b>{league}</b>")
-        for a in chunk[:5]:
-            lines.append(f"• {a['match']} — ROI ~ {a['roi_pct']}%")
-            lines.append(f"  H: {a['triplet'][0][1]} @ {a['triplet'][0][2]}")
-            lines.append(f"  D: {a['triplet'][1][1]} @ {a['triplet'][1][2]}")
-            lines.append(f"  A: {a['triplet'][2][1]} @ {a['triplet'][2][2]}")
-            count += 1
-            if a["roi_pct"] > 5.0 and len(betslip_blocks) < 3:
-                plan, equalized = stake_plan(a["triplet"], bankroll, commission_map={}, round_step=round_step)
-                betslip_text = build_betslip_text(league, a["match"], a["roi_pct"], bankroll, plan, currency, show_eq, equalized)
-                betslip_blocks.append(f"<pre>{betslip_text}</pre>")
-        if count >= 12: break
-    if betslip_blocks:
-        lines.append("\n<b>High-ROI betslips (ROI>5%)</b>")
-        lines.extend(betslip_blocks)
-
-    telegram_send(token, chat_id, "\n".join(lines))
-    print(f"Sent {len(all_arbs)} arbs.")
-
-if __name__ == "__main__":
-    main()
+    return arbs
