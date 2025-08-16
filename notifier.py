@@ -1,27 +1,10 @@
-import json
+
 """
-ENG Arb Notifier — 1X2 + Corners O/U (same schedule)
-- Scans English comps for both 1X2 (h2h) and Over/Under Corners (two‑way totals)
-- Sends Telegram alerts; adds betslip blocks for ROI > 5%
-- Minutely workflow with in‑script gating (window) unchanged
-
-Env secrets/vars (GitHub → Settings → Secrets and variables → Actions):
-Secrets:
-- ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-Variables:
-- MIN_ROI_PCT (default 0.2)
-- REGIONS (default "uk,eu")
-- TIMEZONE (default "Europe/Dublin")
-- RAPID_WINDOW_START_ISO, RAPID_WINDOW_END_ISO
-- BANKROLL (default "100")
-- CURRENCY (default "£")
-- STAKE_ROUND (default "0.05")
-- SHOW_EQUALIZED_PAYOUT (default "true")
-- INCLUDE_CORNERS (default "true")  # set to false to disable Corners O/U scan
-
-Notes:
-- Corners O/U uses market keys among: "totals", "totals_corners", "corners", "total_corners", "corners_totals"
-- If your provider mixes totals (goals/cards/corners), we filter by presence of the token "corner" in market metadata
+ENG Arb Notifier — 1X2 + Corners O/U
+- Separate thresholds: MIN_ROI_PCT (scan), MIN_ROI_PCT_NOTIFY (notify)
+- Allowed bookmakers filter (ALLOWED_BOOKMAKERS)
+- Betfair+Partner filter (REQUIRE_BETFAIR_PAIR + PARTNER_BOOKS)
+- Minutely schedule with in-script gating window
 """
 import os, sys, json, hashlib, requests
 from typing import Dict, List, Tuple
@@ -43,12 +26,14 @@ SPORTS = [
 
 TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
 
-# --- Allowed bookmakers filter (env-driven) ---
+# Allowed list normalization
 DEFAULT_ALLOWED_BOOKS = ["Bet365","Ladbrokes","William Hill","Pinnacle","Unibet","Coral"]
 def norm(name: str) -> str:
     n = (name or '').strip().lower()
     n = n.replace('ladbrook', 'ladbroke').replace('ladbrooks', 'ladbrokes')
     n = n.replace('uni bet', 'unibet')
+    n = n.replace('will hill','william hill')
+    n = n.replace('boyle sports','boylesports').replace('boyle-sports','boylesports')
     return n
 ALLOWED_BOOKS_CANON = {
     'bet365': {'bet365'},
@@ -71,6 +56,21 @@ def is_allowed(name: str, allowed_norm: set) -> bool:
         if ln in variants and canon in allowed_norm:
             return True
     return False
+
+# Betfair+Partner
+BETFAIR_KEYS = {"betfair","betfair exchange"}
+DEFAULT_PARTNERS = {"bet365","ladbrokes","william hill","boylesports","boyle sports","coral"}
+def parse_partner_env() -> set:
+    raw = os.environ.get('PARTNER_BOOKS','').strip()
+    if not raw:
+        return DEFAULT_PARTNERS
+    return {x.strip().lower() for x in raw.split(',') if x.strip()}
+def is_betfair_exchange(name: str) -> bool:
+    ln = norm(name)
+    return any(k in ln for k in BETFAIR_KEYS)
+def is_partner_book(name: str, partners: set) -> bool:
+    ln = norm(name)
+    return any(p in ln for p in partners)
 
 def is_target_book(name: str) -> bool:
     n = (name or "").lower()
@@ -107,7 +107,6 @@ def extract_h2h(ev: dict) -> Tuple[str, List[Tuple[str,float,str]]]:
     return f"{home} vs {away}", [("Home",*name_map["Home"]),("Draw",*name_map["Draw"]),("Away",*name_map["Away"])]
 
 def extract_corners_ou(ev: dict) -> Tuple[str, List[Tuple[str,float,str]]]:
-    """Return (label, outcomes) where outcomes is [(Over xx.x, odds, book), (Under xx.x, odds, book)] or []"""
     home, away = ev.get("home_team"), ev.get("away_team")
     match_str = f"{home} vs {away}"
     best_ou = {}
@@ -118,7 +117,6 @@ def extract_corners_ou(ev: dict) -> Tuple[str, List[Tuple[str,float,str]]]:
             mkey = m.get("key","")
             if mkey not in ("totals","totals_corners","corners","total_corners","corners_totals"):
                 continue
-            # Filter to corners if totals are mixed
             blob = " ".join([str(m.get("key","")), str(m.get("outcomes","")), str(bk.get("title",""))]).lower()
             if "corner" not in blob:
                 continue
@@ -145,7 +143,7 @@ def extract_corners_ou(ev: dict) -> Tuple[str, List[Tuple[str,float,str]]]:
         over_key, under_key = overs[0], unders[0]
     return match_str, [(over_key, best_ou[over_key][0], best_ou[over_key][1]), (under_key, best_ou[under_key][0], best_ou[under_key][1])]
 
-def compute_arbs_for_outcomes(outcomes: List[Tuple[str,float,str]], min_roi_pct: float, commission_map: Dict[str,float]) -> Tuple[float, float]:
+def compute_arbs_for_outcomes(outcomes: List[Tuple[str,float,str]], commission_map: Dict[str,float]) -> Tuple[float, float]:
     implieds = [implied_prob(o, commission_map.get(b,0.0)) for (_,o,b) in outcomes]
     margin = 1.0 - sum(implieds)
     roi = max(margin*100.0, 0.0)
@@ -157,22 +155,11 @@ def stake_plan(outcomes: List[Tuple[str,float,str]], bankroll: float, commission
     plan, payouts = [], []
     for (label, odds, book), ip in zip(outcomes, implieds):
         stake = bankroll * (ip / tot)
-        # round to the nearest step
-        stake = round(round(stake / round_step) * round_step + 1e-9, 2)
         payout = stake * odds * (1 - commission_map.get(book,0.0))
         payouts.append(payout)
-        plan.append((label, book, odds, stake))
+        plan.append((label, book, odds, round(stake,2)))
     eq = min(payouts) if payouts else 0.0
     return plan, eq
-
-def build_betslip_text(league: str, match: str, market: str, roi_pct: float, bankroll: float, plan: List[Tuple[str,str,float,float]], currency_symbol: str, show_equalized: bool, equalized_payout: float) -> str:
-    lines = [f"Betslip — {league} ({market})", f"{match}", f"Bankroll: {currency_symbol}{bankroll:,.2f}  |  ROI≈ {roi_pct:.2f}%", "-"*44]
-    for label, book, odds, stake in plan:
-        lines.append(f"{label:<10} @ {book[:18]:<18}  {odds:<5}  {currency_symbol}{stake:,.2f}")
-    if show_equalized:
-        lines.append("-"*44)
-        lines.append(f"Equalized payout (approx): {currency_symbol}{equalized_payout:,.2f}")
-    return "\\n".join(lines)
 
 def telegram_send(token: str, chat_id: str, text: str):
     requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
@@ -209,6 +196,7 @@ def main():
     round_step = float(os.environ.get("STAKE_ROUND", "0.05"))
     show_eq = os.environ.get("SHOW_EQUALIZED_PAYOUT", "true").lower() in ("1","true","yes")
     include_corners = os.environ.get("INCLUDE_CORNERS", "true").lower() in ("1","true","yes")
+    require_betfair_pair = os.environ.get("REQUIRE_BETFAIR_PAIR", "false").lower() in ("1","true","yes")
     test_mode = os.environ.get("TEST_MODE","").lower() in ("1","true","yes")
     if not (token and chat_id):
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID", file=sys.stderr); sys.exit(1)
@@ -222,17 +210,17 @@ def main():
     if not api_key:
         print("Missing ODDS_API_KEY", file=sys.stderr); sys.exit(1)
     min_roi_scan = float(os.environ.get("MIN_ROI_PCT","0.2"))
-    min_roi_notify_env = os.environ.get("MIN_ROI_PCT_NOTIFY", "").strip()
+    notify_env = os.environ.get("MIN_ROI_PCT_NOTIFY","").strip()
     try:
-        min_roi_notify = float(min_roi_notify_env) if min_roi_notify_env != "" else min_roi_scan
+        min_roi_notify = float(notify_env) if notify_env != "" else min_roi_scan
     except Exception:
         min_roi_notify = min_roi_scan
     regions = [x.strip() for x in os.environ.get("REGIONS","uk,eu").split(",") if x.strip()]
 
-    all_arbs = []  # list of dicts: {league, market, match, outcomes, roi_pct}
+    all_arbs = []
     for (league, sport_key) in SPORTS:
         try:
-            events = fetch_odds(api_key, sport_key, regions, ["h2h","totals"])  # fetch both in one call
+            events = fetch_odds(api_key, sport_key, regions, ["h2h","totals"])
         except Exception as e:
             print(f"Fetch failed for {league}: {e}", file=sys.stderr)
             continue
@@ -244,7 +232,10 @@ def main():
                 continue
             if not any(is_target_book(b) for (_,_,b) in outcomes): 
                 continue
-            roi, margin = compute_arbs_for_outcomes(outcomes, min_roi, commission_map={})
+            allowed_norm = parse_allowed_env()
+            if not all(is_allowed(b, allowed_norm) for (_,_,b) in outcomes):
+                continue
+            roi, margin = compute_arbs_for_outcomes(outcomes, commission_map={})
             if roi >= min_roi_scan:
                 all_arbs.append({"league":league, "market":"1X2", "match":match, "outcomes":outcomes, "roi_pct":round(roi,3)})
 
@@ -256,23 +247,35 @@ def main():
                     continue
                 if not any(is_target_book(b) for (_,_,b) in outcomes):
                     continue
-                roi, margin = compute_arbs_for_outcomes(outcomes, min_roi, commission_map={})
+                allowed_norm = parse_allowed_env()
+                if not all(is_allowed(b, allowed_norm) for (_,_,b) in outcomes):
+                    continue
+                if require_betfair_pair and len(outcomes) == 2:
+                    partners = parse_partner_env()
+                    b1 = outcomes[0][2]; b2 = outcomes[1][2]
+                    cond = (is_betfair_exchange(b1) and is_partner_book(b2, partners)) or (is_betfair_exchange(b2) and is_partner_book(b1, partners))
+                    if not cond:
+                        continue
+                roi, margin = compute_arbs_for_outcomes(outcomes, commission_map={})
                 if roi >= min_roi_scan:
                     all_arbs.append({"league":league, "market":"Corners O/U", "match":match, "outcomes":outcomes, "roi_pct":round(roi,3)})
 
     if not all_arbs:
         print("No arbs this run."); return
 
-    # dedupe signal to avoid spam
-    digest = hashlib.sha256(json.dumps(all_arbs, sort_keys=True).encode("utf-8")).hexdigest()
+    # Prepare notified set
+    notified_arbs = [a for a in all_arbs if a.get('roi_pct', 0) >= min_roi_notify]
+    if not notified_arbs:
+        print("No arbs meet notify threshold; not sending."); return
+
+    digest = hashlib.sha256(json.dumps(notified_arbs, sort_keys=True).encode("utf-8")).hexdigest()
     state_file = ".arb_state_hash"; prev = open(state_file).read().strip() if os.path.exists(state_file) else None
     if digest == prev: 
         print("Arbs unchanged; not sending."); 
         return
     with open(state_file,"w") as f: f.write(digest)
 
-    # Build message (group by league, show market label). Add betslips for ROI>5% (max 3 blocks).
-    lines = ["<b>New ENG arbs found</b> (incl. Paddy/Betfair/Sky):"]
+    lines = ["<b>New ENG arbs found</b> (filters applied)"]
     betslip_blocks = []
     count = 0
     for league,_ in SPORTS:
@@ -280,25 +283,17 @@ def main():
         if not chunk: 
             continue
         lines.append(f"\n<b>{league}</b>")
-        for a in chunk[:6]:  # show up to 6 per league
+        for a in chunk[:6]:
             oc = a["outcomes"]
             lines.append(f"• [{a['market']}] {a['match']} — ROI ~ {a['roi_pct']}%")
             for lbl, odds, book in oc:
                 lines.append(f"  {lbl}: {odds} @ {book}")
             count += 1
-            if a["roi_pct"] > 5.0 and len(betslip_blocks) < 3:
-                plan, equalized = stake_plan(oc, bankroll, commission_map={}, round_step=round_step)
-                betslip_text = build_betslip_text(a["league"], a["match"], a["market"], a["roi_pct"], bankroll, plan, currency, show_eq, equalized)
-                betslip_blocks.append(f"<pre>{betslip_text}</pre>")
-        if count >= 12: 
-            break
+            if count >= 12:
+                break
 
-    if betslip_blocks:
-        lines.append("\n<b>High-ROI betslips (ROI>5%)</b>")
-        lines.extend(betslip_blocks)
-
-    telegram_send(token, chat_id, "\\n".join(lines))
-    print(f"Sent {len(all_arbs)} arbs.")
+    telegram_send(token, chat_id, "\n".join(lines))
+    print(f"Sent {len(notified_arbs)} arbs.")
 
 if __name__ == "__main__":
     main()

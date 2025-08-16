@@ -1,66 +1,42 @@
 
-# ENG Arbitrage — Streamlit UI + Telegram Notifier (Repo-ready)
+# ENG Arbitrage — Streamlit UI + Telegram Notifier (Configurable Partners)
 
-This repository is ready to push straight to GitHub and deploy.
+This repository includes:
+- `app.py` — Streamlit UI (1X2 + Corners O/U, CSV export, betslip, debug, allowed-book filter, Betfair+Partner filter with partner picker, in-app Telegram notifications with threshold)
+- `notifier.py` — Scheduled notifier (separate scan/notify thresholds, allowed-book filter, Betfair+Partner filter with env-driven partners)
+- `.github/workflows/arb_notifier.yml` — GitHub Actions schedule (minutely; self-gated window)
+- `.streamlit/secrets.toml.template` — Example for local dev
+- `requirements.txt`, `.gitignore`, `README.md`
 
-## Structure
-- `app.py` — Streamlit UI (all English comps on one screen, CSV exports, betslip copy block)
-- `requirements.txt` — Python deps for Streamlit Cloud
-- `notifier.py` — Telegram background notifier (minutely with time-window gating; adds betslip blocks for ROI>5%)
-- `.github/workflows/arb_notifier.yml` — Scheduled GitHub Action
-- `.streamlit/secrets.toml.template` — Example secrets file for local dev
-- `.gitignore` — Ignores local env files & artifacts
-- `README.md` — You are here
-
-## Quick start (GitHub + Streamlit Cloud)
-
-1. **Create repo** on GitHub and upload these files (keep the folder structure).
-2. In the repo, set **Settings → Secrets and variables → Actions**:
+## Variables (GitHub → Settings → Secrets and variables → Actions)
 
 **Secrets**
-- `ODDS_API_KEY` — your The Odds API key
-- `TELEGRAM_BOT_TOKEN` — from @BotFather
-- `TELEGRAM_CHAT_ID` — your numeric chat id
+- `ODDS_API_KEY`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
 
-**Variables** (tweak as you like)
-- `MIN_ROI_PCT` = `0.2`
-- `REGIONS` = `uk,eu`
-- `TIMEZONE` = `Europe/Dublin`
-- `RAPID_WINDOW_START_ISO` = `2025-08-16T12:00:00`
-- `RAPID_WINDOW_END_ISO`   = `2025-08-16T17:00:00`
-- `BANKROLL` = `100`
-- `CURRENCY` = `£`
-- `STAKE_ROUND` = `0.05`
-- `SHOW_EQUALIZED_PAYOUT` = `true`
+**Variables**
+- `MIN_ROI_PCT` — scan threshold (e.g., `0.2`)
+- `MIN_ROI_PCT_NOTIFY` — notify threshold (fallback to `MIN_ROI_PCT` if blank)
+- `REGIONS` — e.g., `uk,eu`
+- `TIMEZONE` — e.g., `Europe/Dublin`
+- `RAPID_WINDOW_START_ISO` / `RAPID_WINDOW_END_ISO`
+- `BANKROLL`, `CURRENCY`, `STAKE_ROUND`, `SHOW_EQUALIZED_PAYOUT`
+- `INCLUDE_CORNERS` — `true`/`false`
+- `ALLOWED_BOOKMAKERS` — comma-separated (applies to both 1X2 and Corners)
+- `REQUIRE_BETFAIR_PAIR` — `true` to require Betfair+Partner for two-way markets
+- `PARTNER_BOOKS` — comma-separated partners for Betfair pairing (e.g., `Bet365,Ladbrokes,William Hill,BoyleSports,Coral`)
 
-3. **Streamlit Cloud** → New App → point to `app.py` on this repo.
-4. In Streamlit (optional) add **Secrets** (Settings → Secrets):
-```toml
-[telegram]
-bot_token = "YOUR_BOT_TOKEN"
-chat_id = "YOUR_CHAT_ID"
-```
-5. Open the app, paste your **Odds API key** in the sidebar, and you’re off.
+## Streamlit Sidebar
+- **Minimum ROI to notify** (in-app alerts)
+- **Minimum ROI to show** (UI filter)
+- **Allowed bookmakers** w/ preset (**UK Big 6**)
+- **Betfair partner bookmakers** (multiselect) used when *Require Betfair + partner* is ON
+
+> Note: The Betfair+Partner filter only applies to **two-outcome** markets (like Corners O/U), not 1X2.
 
 ## Local dev
-- Create a virtualenv and install `requirements.txt`:
-  ```bash
-  pip install -r requirements.txt
-  streamlit run app.py
-  ```
-- To use Telegram test locally, copy `.streamlit/secrets.toml.template` to `.streamlit/secrets.toml` and fill it.
-
----
-
-**Note:** Always confirm odds before staking; prices move and limits apply.
-
-
-## Notifier thresholds
-- `MIN_ROI_PCT` — **scan threshold** (arbs must be ≥ this to be collected).
-- `MIN_ROI_PCT_NOTIFY` — **notification threshold** (arbs must be ≥ this to be sent to Telegram). If not set, it falls back to `MIN_ROI_PCT`.
-
-
-## Allowed bookmakers filter
-- UI: toggle **Restrict to specific bookmakers** and pick from the list (Bet365, Ladbrokes, William Hill, Pinnacle, Unibet, Coral).
-- Notifier: set **Actions Variable** `ALLOWED_BOOKMAKERS` to a comma-separated list, e.g.:
-  `Bet365,Ladbrokes,William Hill,Pinnacle,Unibet,Coral`
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```

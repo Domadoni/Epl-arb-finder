@@ -1,12 +1,16 @@
+
 """
 ENG Arbitrage — All competitions on one screen
+Features:
 - Markets: 1X2 and Corners Over/Under
 - Generic "Best Outcomes" rendering (works for both markets)
 - CSV exports (summary + detailed)
 - Betslip copy block
 - Debug toggle to inspect market keys
+- Allowed bookmakers filter (with "UK Big 6" preset)
+- Betfair+Partner filter (two-way only) with configurable partner list
+- In-app Telegram: "Minimum ROI to notify" slider + digest
 """
-import time, hashlib, json, urllib.parse
 from typing import Dict, List, Tuple
 from datetime import datetime
 try:
@@ -14,22 +18,10 @@ try:
 except Exception:
     ZoneInfo = None
 
+import hashlib, json, urllib.parse
 import pandas as pd
 import requests
 import streamlit as st
-import requests
-
-def telegram_send(bot_token: str, chat_id: str, text: str):
-    """Send a Telegram message to the given chat_id."""
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10
-        )
-    except Exception as e:
-        st.error(f"Telegram send failed: {e}")
-
 from dateutil import parser as dtparser
 
 BASE_URL = "https://api.the-odds-api.com/v4"
@@ -50,42 +42,55 @@ SUPPORTED_MARKETS = {
 
 DEFAULT_REGIONS = ["uk", "eu"]
 TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
-
-
-# --- Allowed bookmakers filter ---
-DEFAULT_ALLOWED_BOOKS = [
-    'Bet365', 'Ladbrokes', 'William Hill', 'Pinnacle', 'Unibet', 'Coral'
-]
-def ALLOWED_BOOK_NORMALIZE(name: str) -> str:
-    n = (name or '').strip().lower()
-    # normalize common variants/typos
-    n = n.replace('ladbrook', 'ladbroke').replace('ladbrooks', 'ladbrokes')
-    n = n.replace('uni bet', 'unibet')
-    return n
-ALLOWED_BOOKS_CANON = {
-    'bet365': {'bet365'},
-    'ladbrokes': {'ladbroke', 'ladbrokes'},
-    'william hill': {'william hill','williamhill','will hill'},
-    'pinnacle': {'pinnacle','pinny'},
-    'unibet': {'unibet','uni bet'},
-    'coral': {'coral'},
-}
-def is_allowed_book(name: str, allowed_set_norm: set) -> bool:
-    ln = ALLOWED_BOOK_NORMALIZE(name)
-    # direct match
-    if ln in allowed_set_norm:
-        return True
-    # check canonical groups
-    for canon, variants in ALLOWED_BOOKS_CANON.items():
-        if ln in variants and canon in allowed_set_norm:
-            return True
-    return False
 BOOKMAKER_BASELINKS = [
     ("paddy power", "https://www.paddypower.com/"),
     ("betfair", "https://www.betfair.com/exchange/plus/"),
     ("sky bet", "https://m.skybet.com/"),
     ("skybet", "https://m.skybet.com/"),
 ]
+
+# --- Allowed bookmakers filter ---
+DEFAULT_ALLOWED_BOOKS = [
+    "Bet365", "Ladbrokes", "William Hill", "Pinnacle", "Unibet", "Coral"
+]
+def ALLOWED_BOOK_NORMALIZE(name: str) -> str:
+    n = (name or "").strip().lower()
+    n = n.replace("ladbrook", "ladbroke").replace("ladbrooks", "ladbrokes")
+    n = n.replace("uni bet", "unibet")
+    return n
+
+ALLOWED_BOOKS_CANON = {
+    "bet365": {"bet365"},
+    "ladbrokes": {"ladbroke", "ladbrokes"},
+    "william hill": {"william hill", "williamhill", "will hill"},
+    "pinnacle": {"pinnacle", "pinny"},
+    "unibet": {"unibet", "uni bet"},
+    "coral": {"coral"},
+}
+def is_allowed_book(name: str, allowed_set_norm: set) -> bool:
+    ln = ALLOWED_BOOK_NORMALIZE(name)
+    if ln in allowed_set_norm:
+        return True
+    for canon, variants in ALLOWED_BOOKS_CANON.items():
+        if ln in variants and canon in allowed_set_norm:
+            return True
+    return False
+
+# --- Betfair + Partner helpers (two-way only) ---
+BETFAIR_KEYS = {"betfair", "betfair exchange"}
+def norm_book(n: str) -> str:
+    n = (n or "").strip().lower()
+    n = n.replace("ladbrook","ladbroke").replace("ladbrooks","ladbrokes")
+    n = n.replace("will hill","william hill")
+    n = n.replace("boyle sports","boylesports").replace("boyle-sports","boylesports")
+    n = n.replace("uni bet","unibet")
+    return n
+def is_betfair_exchange(name: str) -> bool:
+    ln = norm_book(name)
+    return any(k in ln for k in BETFAIR_KEYS)
+def is_partner_book(name: str, partner_set: set) -> bool:
+    ln = norm_book(name)
+    return any(p in ln for p in partner_set)
 
 def is_target_book(name: str) -> bool:
     n = (name or "").lower()
@@ -109,11 +114,11 @@ def stake_split_for_arbitrage(best_odds: List[Tuple[str, float, str]], bankroll:
         c = commission_map.get(book, 0.0)
         ip = 1.0 / (odds * (1 - c)) if odds > 0 else float("inf")
         implieds.append(ip)
-    total_ip = sum(implieds)
+    total_ip = sum(implieds) or 1.0
     margin = 1.0 - total_ip
     payouts = []
     for (outcome, odds, book), ip in zip(best_odds, implieds):
-        stake = bankroll * (ip / total_ip) if total_ip > 0 else 0.0
+        stake = bankroll * (ip / total_ip)
         c = commission_map.get(book, 0.0)
         payout = stake * odds * (1 - c)
         payouts.append(payout)
@@ -139,7 +144,19 @@ def build_betslip_text(comp: str, match_str: str, kickoff: str, market: str, roi
     ]
     for _, row in plan_df.iterrows():
         lines.append(f"{row['Outcome']:<12} @ {row['Bookmaker'][:18]:<18}  {row['Odds']:<5}  £{row['Stake']:.2f}")
-    return "\\n".join(lines)
+    return "\n".join(lines)
+
+def telegram_send(bot_token: str, chat_id: str, text: str) -> None:
+    if not bot_token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        ).raise_for_status()
+    except Exception as e:
+        st.warning(f"Telegram send failed: {e}")
 
 @st.cache_data(ttl=60)
 def fetch_odds(api_key: str, sport_key: str, regions: List[str], markets: List[str]) -> List[dict]:
@@ -172,12 +189,14 @@ with st.sidebar:
     include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
     restrict_allowed = st.checkbox('Restrict to specific bookmakers', value=False)
+    # Preset + multiselect
+    preset = st.selectbox('Allowed bookmakers preset', ['Custom', 'UK Big 6'], index=1)
     allowed_books = st.multiselect('Allowed bookmakers', DEFAULT_ALLOWED_BOOKS, default=DEFAULT_ALLOWED_BOOKS)
-    # Quick presets
-    preset = st.radio('Presets', ['Custom','UK Big 6'], horizontal=True)
-    if preset == 'UK Big 6':
-        allowed_books = DEFAULT_ALLOWED_BOOKS
-
+    # Betfair + Partner (two-way only)
+    betfair_pair_only = st.checkbox('Require Betfair Exchange + one partner (two-way only)', value=False)
+    partner_options = ['Bet365','Ladbrokes','William Hill','BoyleSports','Coral']
+    selected_partners = st.multiselect('Betfair partner bookmakers', partner_options, default=partner_options)
+    partner_norm = {s.strip().lower() for s in selected_partners} if selected_partners else set()
 
     show_debug = st.checkbox("Show raw market keys (debug)", value=False)
 
@@ -218,7 +237,6 @@ for comp in comps:
         fetch_errors.append(f"{comp}: {e}")
         continue
 
-    # Optional commission inputs (per comp)
     if include_commission and events:
         all_books = sorted({b.get("title", b.get("key","")) for ev in events for b in ev.get("bookmakers",[]) })
         with st.sidebar:
@@ -232,13 +250,11 @@ for comp in comps:
         home = ev.get("home_team"); away = ev.get("away_team")
         commence_time = dtparser.parse(ev.get("commence_time")) if ev.get("commence_time") else None
 
-        # collect best prices by outcome name first
         best = {}
         for bk in ev.get("bookmakers", []):
             book_name = bk.get("title") or bk.get("key")
             for market in bk.get("markets", []):
                 mkey = market.get("key")
-                # basic filter: allow exact market or generic totals for corners
                 if market_key == "h2h" and mkey != "h2h":
                     continue
                 if market_key == "totals_corners" and mkey not in ("totals","totals_corners","corners","total_corners","corners_totals"):
@@ -249,7 +265,6 @@ for comp in comps:
                     if name not in best or price > best[name][0]:
                         best[name] = (price, book_name, outcome.get("point"))
 
-        # build best_outcomes depending on market
         if market_key == "h2h":
             needed = [home, "Draw", away]; name_map = {}
             for k, v in best.items():
@@ -264,23 +279,17 @@ for comp in comps:
                 ("Draw", name_map["Draw"][0], name_map["Draw"][1]),
                 ("Away", name_map[away][0], name_map[away][1]),
             ]
-
         elif market_key == "totals_corners":
-            # Additional guard: ensure we're really looking at corners totals
-            # by checking for "corner" in any market/outcome text
             looks_like_corners = any("corner" in str(x).lower() for x in [best.keys(), ev.get("bookmakers", [])])
             if not looks_like_corners and show_debug:
                 st.caption(f"Skipping non-corners totals for {home} vs {away}")
                 continue
-            # choose a line (point) if present
             line = None
             for nm, (_, _, pt) in best.items():
                 if isinstance(pt, (int, float)):
                     line = pt; break
-            # prefer explicit Over/Under labels
             over_label = f"Over {line}" if line is not None else "Over"
             under_label = f"Under {line}" if line is not None else "Under"
-            # fallback: find any key starting with Over/Under
             if over_label not in best:
                 overs = [k for k in best if k.lower().startswith("over")]
                 if overs: over_label = overs[0]
@@ -293,26 +302,30 @@ for comp in comps:
                 (over_label, best[over_label][0], best[over_label][1]),
                 (under_label, best[under_label][0], best[under_label][1]),
             ]
-
         else:
             continue
 
-        # target-book filter
+        # Target-book filter
         if filter_to_target:
             books_in_arb = {b for (_,_,b) in best_outcomes}
             if not any(is_target_book(b) for b in books_in_arb):
                 continue
 
-        # Allowed-books restriction
-        if 'restrict_allowed' in locals() and restrict_allowed:
-                        # Choose preset unless Custom selected; fall back safely if preset is missing
-            try:
-                eff_books = allowed_books if preset == 'Custom' else DEFAULT_ALLOWED_BOOKS
-            except NameError:
-                eff_books = allowed_books
+        # Allowed-books restriction (preset or custom)
+        if restrict_allowed:
+            eff_books = allowed_books if preset == 'Custom' else DEFAULT_ALLOWED_BOOKS
             allowed_norm = {ALLOWED_BOOK_NORMALIZE(x) for x in eff_books}
             if not all(is_allowed_book(b, allowed_norm) for (_,_,b) in best_outcomes):
                 continue
+
+        # Betfair+Partner restriction (two-way markets only)
+        if betfair_pair_only and market_key != 'h2h':
+            partners = partner_norm if partner_norm else {"bet365","ladbrokes","william hill","boylesports","boyle sports","coral"}
+            if len(best_outcomes) == 2:
+                b1 = best_outcomes[0][2]; b2 = best_outcomes[1][2]
+                cond = (is_betfair_exchange(b1) and is_partner_book(b2, partners)) or (is_betfair_exchange(b2) and is_partner_book(b1, partners))
+                if not cond:
+                    continue
 
         # arb math
         implieds = [1.0/(o*(1-commission_map.get(b,0.0))) for (_,o,b) in best_outcomes]
@@ -321,7 +334,6 @@ for comp in comps:
         if roi_est < min_roi:
             continue
 
-        # plan + record
         plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_outcomes, bankroll, commission_map)
         match_str = f"{home} vs {away}"
         best_strs = [f"{lab}: {odds} @ {book}" for (lab,odds,book) in best_outcomes]
@@ -367,12 +379,11 @@ else:
                 st.caption("Copy as betslip")
                 st.code(rec["BetslipText"])
 
-
 # --- In-app Telegram notifications (session-based) ---
 if "last_arb_digest_notify" not in st.session_state:
     st.session_state["last_arb_digest_notify"] = ""
 
-if bot_token and chat_id and 'notify_live' in locals() and notify_live:
+if bot_token and chat_id and notify_live:
     arbs_to_notify = [r for r in all_records if r["Arb Margin %"] >= min_roi_notify]
     if arbs_to_notify:
         payload = [{k: r[k] for k in ("Competition","Match","Kickoff","Market","Arb Margin %")} for r in arbs_to_notify]
@@ -394,9 +405,9 @@ if bot_token and chat_id and 'notify_live' in locals() and notify_live:
             telegram_send(bot_token, chat_id, "\n".join(lines))
             st.session_state["last_arb_digest_notify"] = digest
             st.toast("Telegram notification sent ✅", icon="✅")
+
 # CSV downloads
 if all_records:
-    # Summary CSV
     export_summary_df = pd.DataFrame([{
         "Competition": r["Competition"],
         "Match": r["Match"],
@@ -408,7 +419,6 @@ if all_records:
         "Regions": fetched_regions,
     } for r in all_records]).sort_values(["Competition", "Kickoff", "Match"])
 
-    # Detailed CSV (per outcome with stakes)
     detailed_rows = []
     for r in all_records:
         plan_df = r["Plan"].copy()
