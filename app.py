@@ -186,12 +186,9 @@ with st.sidebar:
     bankroll = st.number_input("Bankroll to allocate per bet (£)", min_value=0.0, value=100.0, step=10.0)
     min_roi_notify = st.slider("Minimum ROI to notify (percent)", min_value=-10.0, max_value=10.0, value=2.0, step=0.1)
     min_roi = st.slider("Minimum ROI to show (percent)", min_value=-10.0, max_value=10.0, value=0.2, step=0.1)
-    include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
     restrict_allowed = st.checkbox('Restrict to specific bookmakers', value=False)
-    # Preset + multiselect
-    preset = st.selectbox('Allowed bookmakers preset', ['Custom', 'UK Big 6'], index=1)
-    allowed_books = st.multiselect('Allowed bookmakers', DEFAULT_ALLOWED_BOOKS, default=DEFAULT_ALLOWED_BOOKS)
+    # Preset + multiselect    allowed_books = st.multiselect('Allowed bookmakers', DEFAULT_ALLOWED_BOOKS, default=DEFAULT_ALLOWED_BOOKS)
     # Betfair + Partner (two-way only)
     betfair_pair_only = st.checkbox('Require Betfair Exchange + one partner (two-way only)', value=False)
     partner_options = ['Bet365','Ladbrokes','William Hill','BoyleSports','Coral']
@@ -236,16 +233,6 @@ for comp in comps:
     except Exception as e:
         fetch_errors.append(f"{comp}: {e}")
         continue
-
-    if include_commission and events:
-        all_books = sorted({b.get("title", b.get("key","")) for ev in events for b in ev.get("bookmakers",[]) })
-        with st.sidebar:
-            st.caption(f"Commission for books (visible in {comp})")
-            for bk in all_books:
-                key = f"commission_{comp}_{bk}"
-                pct = st.number_input(f"{bk}", min_value=0.0, max_value=0.10, value=0.0, step=0.005, key=key)
-                commission_map[bk] = pct
-
     for ev in events:
         home = ev.get("home_team"); away = ev.get("away_team")
         commence_time = dtparser.parse(ev.get("commence_time")) if ev.get("commence_time") else None
@@ -313,7 +300,7 @@ for comp in comps:
 
         # Allowed-books restriction (preset or custom)
         if restrict_allowed:
-            eff_books = allowed_books if preset == 'Custom' else DEFAULT_ALLOWED_BOOKS
+            eff_books = allowed_books
             allowed_norm = {ALLOWED_BOOK_NORMALIZE(x) for x in eff_books}
             if not all(is_allowed_book(b, allowed_norm) for (_,_,b) in best_outcomes):
                 continue
