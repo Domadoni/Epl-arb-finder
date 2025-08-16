@@ -31,7 +31,10 @@ SPORT_KEYS = {
 }
 
 DEFAULT_REGIONS = ["uk", "eu"]
-SUPPORTED_MARKETS = {"Match Result (1X2)": "h2h"}
+SUPPORTED_MARKETS = {
+    "Match Result (1X2)": "h2h",
+    "Corners Over/Under": "totals_corners"
+}
 
 TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
 BOOKMAKER_BASELINKS = [
@@ -166,6 +169,7 @@ with st.sidebar:
     min_roi = st.slider("Minimum ROI to show (percent)", min_value=-10.0, max_value=10.0, value=0.2, step=0.1)
     include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
+    show_debug = st.checkbox("Show raw market keys (debug)", value=False)
 
     commission_map: Dict[str, float] = {}
     if include_commission:
@@ -228,28 +232,88 @@ for comp in comps:
                     name = outcome.get("name"); price = float(outcome.get("price"))
                     if name not in best or price > best[name][0]: best[name] = (price, book_name)
 
+        
         if market_key == "h2h":
+            # ----- 1X2 (Home/Draw/Away) -----
             needed = [home, "Draw", away]; name_map = {}
             for k in list(best.keys()):
                 low = k.lower()
                 if "draw" in low: name_map["Draw"] = best[k]
                 elif home and home.lower() in low: name_map[home] = best[k]
                 elif away and away.lower() in low: name_map[away] = best[k]
-            if not all(x in name_map for x in needed): continue
-            best_triplet = [("Home", name_map[home][0], name_map[home][1]), ("Draw", name_map["Draw"][0], name_map["Draw"][1]), ("Away", name_map[away][0], name_map[away][1])]
+            if not all(x in name_map for x in needed):
+                continue
+            best_outcomes = [
+                ("Home", name_map[home][0], name_map[home][1]),
+                ("Draw", name_map["Draw"][0], name_map["Draw"][1]),
+                ("Away", name_map[away][0], name_map[away][1]),
+            ]
+
+        elif market_key == "totals_corners":
+            # ----- Over/Under Corners (two-way) -----
+            best_ou = {}
+            line_seen = None
+            filter_corners = True
+            match_token = "corner"
+            # Optional debug: show market keys
+            if show_debug:
+                mk = sorted({m.get("key","") for b in ev.get("bookmakers",[]) for m in b.get("markets",[])})
+                st.caption(f"Markets visible for {home} vs {away}: {mk}")
+            for bk in ev.get("bookmakers", []):
+                book_name = bk.get("title") or bk.get("key")
+                for m in bk.get("markets", []):
+                    mkey = m.get("key", "")
+                    if mkey not in ("totals", "totals_corners", "corners", "total_corners", "corners_totals"):
+                        continue
+                    text_blob = " ".join([
+                        str(m.get("key", "")),
+                        str(m.get("last_update", "")),
+                        str(m.get("outcomes", "")),
+                        str(bk.get("key", "")),
+                        str(bk.get("title", "")),
+                    ]).lower()
+                    if filter_corners and match_token not in text_blob:
+                        continue
+                    for o in m.get("outcomes", []):
+                        name = (o.get("name") or "").strip()
+                        price = float(o.get("price"))
+                        point = o.get("point")
+                        if name.lower() in ("over", "under"):
+                            label = f"{name.title()} {point}" if point is not None else name.title()
+                            if point is not None:
+                                line_seen = point
+                            if label not in best_ou or price > best_ou[label][0]:
+                                best_ou[label] = (price, book_name)
+            if not best_ou:
+                continue
+            ou_over = f"Over {line_seen}" if line_seen is not None else "Over"
+            ou_under = f"Under {line_seen}" if line_seen is not None else "Under"
+            if ou_over not in best_ou or ou_under not in best_ou:
+                pairs = list(best_ou.keys())
+                overs = [k for k in pairs if k.lower().startswith("over")]
+                unders = [k for k in pairs if k.lower().startswith("under")]
+                if not (overs and unders):
+                    continue
+                ou_over, ou_under = overs[0], unders[0]
+            best_outcomes = [
+                (ou_over,  best_ou[ou_over][0],  best_ou[ou_over][1]),
+                (ou_under, best_ou[ou_under][0], best_ou[ou_under][1]),
+            ]
+
         else:
             continue
 
+
         if filter_to_target:
-            books_in_arb = {b for (_,_,b) in best_triplet}
+            books_in_arb = {b for (_,_,b) in best_outcomes}
             if not any(is_target_book(b) for b in books_in_arb): continue
 
-        implieds = [1.0/(o*(1-commission_map.get(b,0.0))) for (_,o,b) in best_triplet]
+        implieds = [1.0/(o*(1-commission_map.get(b,0.0))) for (_,o,b) in best_outcomes]
         margin = 1.0 - sum(implieds)
         roi_est = max(margin*100.0, 0.0)
 
         if roi_est >= min_roi:
-            plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_triplet, bankroll, commission_map)
+            plan_df, roi_pct, margin2 = stake_split_for_arbitrage(best_outcomes, bankroll, commission_map)
             # Add link column to the per-outcome plan and format columns
             match_str = f"{home} vs {away}"
             plan_df["Stake"] = plan_df["Stake"].apply(lambda v: round_stake(float(v), stake_step))
@@ -262,9 +326,9 @@ for comp in comps:
                 "Competition": comp,
                 "Match": match_str,
                 "Kickoff": commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else "",
-                "Best Home": f"{best_triplet[0][1]} @ {best_triplet[0][2]}",
-                "Best Draw": f"{best_triplet[1][1]} @ {best_triplet[1][2]}",
-                "Best Away": f"{best_triplet[2][1]} @ {best_triplet[2][2]}",
+                "Best Outcomes": [f"{lab}: {odds} @ {book}" for (lab,odds,book) in best_outcomes],
+                
+                
                 "Arb Margin %": round(margin2*100, 3),
                 "Plan": plan_df,
                 "BetslipText": build_betslip_text(comp, match_str, (commence_time.strftime("%Y-%m-%d %H:%M") if commence_time else ""), roi_pct, bankroll, plan_df, currency_symbol, stake_step, odds_decimals, show_equalized),
@@ -287,9 +351,8 @@ else:
         "Competition": r["Competition"],
         "Match": r["Match"],
         "Kickoff": r["Kickoff"],
-        "Best Home": r["Best Home"],
-        "Best Draw": r["Best Draw"],
-        "Best Away": r["Best Away"],
+        "Market": market_label,
+        "Best": " | ".join(r.get("Best Outcomes", [])) if isinstance(r.get("Best Outcomes", []), list) else r.get("Best Outcomes", ""),
         "Arb Margin %": r["Arb Margin %"],
     } for r in all_records]).sort_values(["Competition", "Kickoff", "Match"])
     st.dataframe(summary_df, use_container_width=True)
@@ -316,9 +379,7 @@ if all_records:
         "Competition": r["Competition"],
         "Match": r["Match"],
         "Kickoff": r["Kickoff"],
-        "Best Home": r["Best Home"],
-        "Best Draw": r["Best Draw"],
-        "Best Away": r["Best Away"],
+        "Best": " | ".join(r.get("Best Outcomes", [])) if isinstance(r.get("Best Outcomes", []), list) else r.get("Best Outcomes", ""),
         "Arb Margin %": r["Arb Margin %"],
         "Fetched At (Europe/Dublin)": fetched_at,
         "Regions": fetched_regions,
