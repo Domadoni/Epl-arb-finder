@@ -199,6 +199,20 @@ with st.sidebar:
 
     commission_map: Dict[str, float] = {}
 
+
+    st.subheader("🔔 Telegram alerts (optional)")
+    bot_token = st.text_input("Bot token", value="", type="password", help="Create via @BotFather")
+    chat_id = st.text_input("Chat ID", value="", help="Your user or group chat id")
+    notify_live = st.checkbox("Notify when new arbs appear", value=False)
+    if st.button("Send test"):
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": "✅ Test from ENG Arb Finder", "parse_mode":"HTML"}, timeout=15
+            ).raise_for_status()
+            st.success("Test sent (check Telegram).")
+        except Exception as e:
+            st.warning(f"Telegram send failed: {e}")
 if not api_key:
     st.info("Enter your API key in the sidebar to fetch live odds."); st.stop()
 
