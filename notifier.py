@@ -43,6 +43,35 @@ SPORTS = [
 
 TARGET_BOOK_KEYWORDS = {"paddy power","paddypower","betfair","sky bet","skybet"}
 
+# --- Allowed bookmakers filter (env-driven) ---
+DEFAULT_ALLOWED_BOOKS = ["Bet365","Ladbrokes","William Hill","Pinnacle","Unibet","Coral"]
+def norm(name: str) -> str:
+    n = (name or '').strip().lower()
+    n = n.replace('ladbrook', 'ladbroke').replace('ladbrooks', 'ladbrokes')
+    n = n.replace('uni bet', 'unibet')
+    return n
+ALLOWED_BOOKS_CANON = {
+    'bet365': {'bet365'},
+    'ladbrokes': {'ladbroke','ladbrokes'},
+    'william hill': {'william hill','williamhill','will hill'},
+    'pinnacle': {'pinnacle','pinny'},
+    'unibet': {'unibet','uni bet'},
+    'coral': {'coral'},
+}
+def parse_allowed_env() -> set:
+    raw = os.environ.get('ALLOWED_BOOKMAKERS','').strip()
+    if not raw:
+        return {norm(x) for x in DEFAULT_ALLOWED_BOOKS}
+    return {norm(x) for x in raw.split(',') if x.strip()}
+def is_allowed(name: str, allowed_norm: set) -> bool:
+    ln = norm(name)
+    if ln in allowed_norm:
+        return True
+    for canon, variants in ALLOWED_BOOKS_CANON.items():
+        if ln in variants and canon in allowed_norm:
+            return True
+    return False
+
 def is_target_book(name: str) -> bool:
     n = (name or "").lower()
     return any(k in n for k in TARGET_BOOK_KEYWORDS)

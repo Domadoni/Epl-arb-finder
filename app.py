@@ -37,6 +37,36 @@ SUPPORTED_MARKETS = {
 
 DEFAULT_REGIONS = ["uk", "eu"]
 TARGET_BOOK_KEYWORDS = {"paddy power", "paddypower", "betfair", "sky bet", "skybet"}
+
+
+# --- Allowed bookmakers filter ---
+DEFAULT_ALLOWED_BOOKS = [
+    'Bet365', 'Ladbrokes', 'William Hill', 'Pinnacle', 'Unibet', 'Coral'
+]
+def ALLOWED_BOOK_NORMALIZE(name: str) -> str:
+    n = (name or '').strip().lower()
+    # normalize common variants/typos
+    n = n.replace('ladbrook', 'ladbroke').replace('ladbrooks', 'ladbrokes')
+    n = n.replace('uni bet', 'unibet')
+    return n
+ALLOWED_BOOKS_CANON = {
+    'bet365': {'bet365'},
+    'ladbrokes': {'ladbroke', 'ladbrokes'},
+    'william hill': {'william hill','williamhill','will hill'},
+    'pinnacle': {'pinnacle','pinny'},
+    'unibet': {'unibet','uni bet'},
+    'coral': {'coral'},
+}
+def is_allowed_book(name: str, allowed_set_norm: set) -> bool:
+    ln = ALLOWED_BOOK_NORMALIZE(name)
+    # direct match
+    if ln in allowed_set_norm:
+        return True
+    # check canonical groups
+    for canon, variants in ALLOWED_BOOKS_CANON.items():
+        if ln in variants and canon in allowed_set_norm:
+            return True
+    return False
 BOOKMAKER_BASELINKS = [
     ("paddy power", "https://www.paddypower.com/"),
     ("betfair", "https://www.betfair.com/exchange/plus/"),
@@ -128,6 +158,14 @@ with st.sidebar:
     min_roi = st.slider("Minimum ROI to show (percent)", min_value=-10.0, max_value=10.0, value=0.2, step=0.1)
     include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
+    restrict_allowed = st.checkbox('Restrict to specific bookmakers', value=False)
+    allowed_books = st.multiselect('Allowed bookmakers', DEFAULT_ALLOWED_BOOKS, default=DEFAULT_ALLOWED_BOOKS)
+    # Quick presets
+    preset = st.radio('Presets', ['Custom','UK Big 6'], horizontal=True)
+    if preset == 'UK Big 6':
+        allowed_books = DEFAULT_ALLOWED_BOOKS
+
+
     show_debug = st.checkbox("Show raw market keys (debug)", value=False)
 
     commission_map: Dict[str, float] = {}
@@ -250,6 +288,14 @@ for comp in comps:
         if filter_to_target:
             books_in_arb = {b for (_,_,b) in best_outcomes}
             if not any(is_target_book(b) for b in books_in_arb):
+                continue
+
+        # Allowed-books restriction
+        if 'restrict_allowed' in locals() and restrict_allowed:
+                        # Choose preset unless Custom selected
+            eff_books = allowed_books if preset == 'Custom' else preset_books
+            allowed_norm = {ALLOWED_BOOK_NORMALIZE(x) for x in eff_books}
+            if not all(is_allowed_book(b, allowed_norm) for (_,_,b) in best_outcomes):
                 continue
 
         # arb math

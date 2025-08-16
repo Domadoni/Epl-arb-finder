@@ -58,3 +58,9 @@ chat_id = "YOUR_CHAT_ID"
 ## Notifier thresholds
 - `MIN_ROI_PCT` — **scan threshold** (arbs must be ≥ this to be collected).
 - `MIN_ROI_PCT_NOTIFY` — **notification threshold** (arbs must be ≥ this to be sent to Telegram). If not set, it falls back to `MIN_ROI_PCT`.
+
+
+## Allowed bookmakers filter
+- UI: toggle **Restrict to specific bookmakers** and pick from the list (Bet365, Ladbrokes, William Hill, Pinnacle, Unibet, Coral).
+- Notifier: set **Actions Variable** `ALLOWED_BOOKMAKERS` to a comma-separated list, e.g.:
+  `Bet365,Ladbrokes,William Hill,Pinnacle,Unibet,Coral`
