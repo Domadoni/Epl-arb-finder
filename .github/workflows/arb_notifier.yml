@@ -1,0 +1,32 @@
+name: ENG Arb Notifier (minutely with window)
+on:
+  schedule:
+    - cron: "* * * * *"   # runs every minute; script self-gates to your window
+  workflow_dispatch: {}
+jobs:
+  run-notifier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests python-dateutil
+      - name: Run notifier (gated)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_ROI_PCT: ${{ vars.MIN_ROI_PCT }}
+          REGIONS: ${{ vars.REGIONS }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
+          RAPID_WINDOW_START_ISO: ${{ vars.RAPID_WINDOW_START_ISO }}
+          RAPID_WINDOW_END_ISO: ${{ vars.RAPID_WINDOW_END_ISO }}
+          BANKROLL: ${{ vars.BANKROLL }}
+          CURRENCY: ${{ vars.CURRENCY }}
+          STAKE_ROUND: ${{ vars.STAKE_ROUND }}
+          SHOW_EQUALIZED_PAYOUT: ${{ vars.SHOW_EQUALIZED_PAYOUT }}
+        run: python notifier.py
