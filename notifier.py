@@ -1,3 +1,51 @@
+
+# --- AUTO-DISCOVERY OF EXISTING FUNCTIONS ---
+import importlib
+
+def _find_first(callables):
+    """callables: list of (module_path, func_name). Return first found callable or None."""
+    for mod, fn in callables:
+        try:
+            m = importlib.import_module(mod)
+            if hasattr(m, fn):
+                return getattr(m, fn)
+        except Exception:
+            continue
+    return None
+
+# Try common places/names you might have used
+_fetch_odds = _find_first([
+    ("odds", "fetch_odds"),
+    ("odds", "get_odds"),
+    ("data", "fetch_odds"),
+    ("data", "get_odds"),
+    ("scrapers", "fetch_odds"),
+    ("scrapers", "get_odds"),
+    ("engine", "fetch_odds"),
+    ("engine", "get_odds"),
+])
+
+_find_arbs = _find_first([
+    ("arbs", "find_arbs"),
+    ("arb", "find_arbs"),
+    ("engine", "find_arbs"),
+    ("core", "find_arbs"),
+])
+
+if _fetch_odds is None or _find_arbs is None:
+    # You can also hard-code your actual import here once you know it:
+    # from my_module import my_fetch as _fetch_odds, my_arbs as _find_arbs
+    missing = []
+    if _fetch_odds is None: missing.append("fetch_odds")
+    if _find_arbs is None: missing.append("find_arbs")
+    raise RuntimeError(
+        "Missing core functions: {}. Either:\n"
+        "  • Rename your existing functions to these names, or\n"
+        "  • Import them in notifier.py and assign:\n"
+        "      _fetch_odds = your_real_fetch\n"
+        "      _find_arbs = your_real_find_arbs\n".format(", ".join(missing))
+    )
+    
 import requests
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, date, time, timedelta
