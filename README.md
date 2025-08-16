@@ -53,3 +53,8 @@ chat_id = "YOUR_CHAT_ID"
 ---
 
 **Note:** Always confirm odds before staking; prices move and limits apply.
+
+
+## Notifier thresholds
+- `MIN_ROI_PCT` — **scan threshold** (arbs must be ≥ this to be collected).
+- `MIN_ROI_PCT_NOTIFY` — **notification threshold** (arbs must be ≥ this to be sent to Telegram). If not set, it falls back to `MIN_ROI_PCT`.

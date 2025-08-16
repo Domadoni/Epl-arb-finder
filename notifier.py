@@ -1,3 +1,4 @@
+import json
 """
 ENG Arb Notifier — 1X2 + Corners O/U (same schedule)
 - Scans English comps for both 1X2 (h2h) and Over/Under Corners (two‑way totals)
@@ -191,7 +192,12 @@ def main():
     api_key = os.environ.get("ODDS_API_KEY")
     if not api_key:
         print("Missing ODDS_API_KEY", file=sys.stderr); sys.exit(1)
-    min_roi = float(os.environ.get("MIN_ROI_PCT","0.2"))
+    min_roi_scan = float(os.environ.get("MIN_ROI_PCT","0.2"))
+    min_roi_notify_env = os.environ.get("MIN_ROI_PCT_NOTIFY", "").strip()
+    try:
+        min_roi_notify = float(min_roi_notify_env) if min_roi_notify_env != "" else min_roi_scan
+    except Exception:
+        min_roi_notify = min_roi_scan
     regions = [x.strip() for x in os.environ.get("REGIONS","uk,eu").split(",") if x.strip()]
 
     all_arbs = []  # list of dicts: {league, market, match, outcomes, roi_pct}
@@ -210,7 +216,7 @@ def main():
             if not any(is_target_book(b) for (_,_,b) in outcomes): 
                 continue
             roi, margin = compute_arbs_for_outcomes(outcomes, min_roi, commission_map={})
-            if roi >= min_roi:
+            if roi >= min_roi_scan:
                 all_arbs.append({"league":league, "market":"1X2", "match":match, "outcomes":outcomes, "roi_pct":round(roi,3)})
 
         # Corners O/U
@@ -222,7 +228,7 @@ def main():
                 if not any(is_target_book(b) for (_,_,b) in outcomes):
                     continue
                 roi, margin = compute_arbs_for_outcomes(outcomes, min_roi, commission_map={})
-                if roi >= min_roi:
+                if roi >= min_roi_scan:
                     all_arbs.append({"league":league, "market":"Corners O/U", "match":match, "outcomes":outcomes, "roi_pct":round(roi,3)})
 
     if not all_arbs:
@@ -241,7 +247,7 @@ def main():
     betslip_blocks = []
     count = 0
     for league,_ in SPORTS:
-        chunk = [a for a in all_arbs if a["league"] == league]
+        chunk = [a for a in notified_arbs if a["league"] == league]
         if not chunk: 
             continue
         lines.append(f"\n<b>{league}</b>")

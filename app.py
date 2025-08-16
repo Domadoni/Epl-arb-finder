@@ -124,6 +124,7 @@ with st.sidebar:
     fetched_regions = ",".join(regions)
     market_label = st.selectbox("Market", list(SUPPORTED_MARKETS.keys()), index=0)
     bankroll = st.number_input("Bankroll to allocate per bet (£)", min_value=0.0, value=100.0, step=10.0)
+    min_roi_notify = st.slider("Minimum ROI to notify (percent)", min_value=-10.0, max_value=10.0, value=2.0, step=0.1)
     min_roi = st.slider("Minimum ROI to show (percent)", min_value=-10.0, max_value=10.0, value=0.2, step=0.1)
     include_commission = st.checkbox("Include per‑book commission (optional)", value=False)
     filter_to_target = st.checkbox("Only show arbs incl. Paddy/Betfair/Sky", value=True)
@@ -142,6 +143,7 @@ with st.sidebar:
     tg_chat_id_default = st.secrets.get("telegram", {}).get("chat_id", "") if "telegram" in st.secrets else ""
     bot_token = st.text_input("Bot token", value=tg_bot_token_default, type="password", help="Create via @BotFather")
     chat_id = st.text_input("Chat ID", value=tg_chat_id_default, help="Your user or group chat id")
+    notify_live = st.checkbox("Notify when new arbs appear", value=False)
     if st.button("Send test"):
         try:
             requests.post(f"https://api.telegram.org/bot{bot_token}/sendMessage",
@@ -303,6 +305,33 @@ else:
                 st.caption("Copy as betslip")
                 st.code(rec["BetslipText"])
 
+
+# --- In-app Telegram notifications (session-based) ---
+if "last_arb_digest_notify" not in st.session_state:
+    st.session_state["last_arb_digest_notify"] = ""
+
+if bot_token and chat_id and 'notify_live' in locals() and notify_live:
+    arbs_to_notify = [r for r in all_records if r["Arb Margin %"] >= min_roi_notify]
+    if arbs_to_notify:
+        payload = [{k: r[k] for k in ("Competition","Match","Kickoff","Market","Arb Margin %")} for r in arbs_to_notify]
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+        if digest != st.session_state["last_arb_digest_notify"]:
+            lines = [f"<b>New arbs ≥ {min_roi_notify:.1f}%</b>"]
+            comps = sorted(set(r["Competition"] for r in arbs_to_notify))
+            shown = 0
+            for comp in comps:
+                lines.append(f"\n<b>{comp}</b>")
+                chunk = [r for r in arbs_to_notify if r["Competition"] == comp][:5]
+                for r in chunk:
+                    lines.append(f"• [{r['Market']}] {r['Match']} — ROI ~ {r['Arb Margin %']}%")
+                    for s in r["Best Outcomes"][:2]:
+                        lines.append(f"  {s}")
+                    shown += 1
+                    if shown >= 12: break
+                if shown >= 12: break
+            telegram_send(bot_token, chat_id, "\n".join(lines))
+            st.session_state["last_arb_digest_notify"] = digest
+            st.toast("Telegram notification sent ✅", icon="✅")
 # CSV downloads
 if all_records:
     # Summary CSV
