@@ -292,8 +292,11 @@ for comp in comps:
 
         # Allowed-books restriction
         if 'restrict_allowed' in locals() and restrict_allowed:
-                        # Choose preset unless Custom selected
-            eff_books = allowed_books if preset == 'Custom' else preset_books
+                        # Choose preset unless Custom selected; fall back safely if preset is missing
+            try:
+                eff_books = allowed_books if preset == 'Custom' else DEFAULT_ALLOWED_BOOKS
+            except NameError:
+                eff_books = allowed_books
             allowed_norm = {ALLOWED_BOOK_NORMALIZE(x) for x in eff_books}
             if not all(is_allowed_book(b, allowed_norm) for (_,_,b) in best_outcomes):
                 continue
