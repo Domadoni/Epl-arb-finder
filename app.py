@@ -51,29 +51,37 @@ competitions = st.multiselect(
 
 results_df = pd.DataFrame()
 if run_scan:
-    results_df = run_notifier(
-        competitions=competitions,
-        bankroll=bankroll,
-        currency=currency,
-        stake_round=stake_round,
-        odds_decimals=odds_decimals,
-        show_equalized=show_equalized,
-        min_roi_share=min_roi_notify,
-        telegram_token=telegram_token or None,
-        telegram_chat_id=telegram_chat_id or None,
-        schedule={
-            "tz": "Europe/Dublin",
-            "target_day": str(target_day),
-            "window_start": window_start.strftime("%H:%M"),
-            "window_end": window_end.strftime("%H:%M"),
-            "high_freq_minutes": int(high_freq_minutes),
-            "low_freq_minutes": int(low_freq_minutes),
-        },
-    )
+    try:
+        results_df = run_notifier(
+            competitions=competitions,
+            bankroll=bankroll,
+            currency=currency,
+            stake_round=stake_round,
+            odds_decimals=odds_decimals,
+            show_equalized=show_equalized,
+            min_roi_share=min_roi_notify,
+            telegram_token=telegram_token or None,
+            telegram_chat_id=telegram_chat_id or None,
+            schedule={
+                "tz": "Europe/Dublin",
+                "target_day": str(target_day),
+                "window_start": window_start.strftime("%H:%M"),
+                "window_end": window_end.strftime("%H:%M"),
+                "high_freq_minutes": int(high_freq_minutes),
+                "low_freq_minutes": int(low_freq_minutes),
+            },
+        )
+    except Exception as e:
+        import traceback
+        st.error(f"Scan failed: {e}")
+        st.caption("Tip: ensure fetch_odds(...) and find_arbs(...) are reachable (see notifier.py auto-discovery).")
+        st.text("".join(traceback.format_exc()))
+        results_df = None
+
     if results_df is not None and len(results_df):
         st.success(f"Found {len(results_df)} arb(s).")
         st.dataframe(results_df, use_container_width=True)
-    else:
+    elif results_df is not None:
         st.info("No arbs found this scan.")
 
 # --- CSV Export ---

@@ -1,10 +1,14 @@
-
-# --- AUTO-DISCOVERY OF EXISTING FUNCTIONS ---
+import requests
+from typing import List, Dict, Any, Tuple
+from datetime import datetime, date, time, timedelta
+import pytz
+import pandas as pd
 import importlib
 
-def _find_first(callables):
-    """callables: list of (module_path, func_name). Return first found callable or None."""
-    for mod, fn in callables:
+# --- AUTO-DISCOVERY OF EXISTING FUNCTIONS ---
+def _find_first(candidates):
+    """candidates: list of (module_path, func_name). Return first found callable or None."""
+    for mod, fn in candidates:
         try:
             m = importlib.import_module(mod)
             if hasattr(m, fn):
@@ -13,7 +17,7 @@ def _find_first(callables):
             continue
     return None
 
-# Try common places/names you might have used
+# Try common places/names; tweak to match your repo if needed
 _fetch_odds = _find_first([
     ("odds", "fetch_odds"),
     ("odds", "get_odds"),
@@ -24,7 +28,6 @@ _fetch_odds = _find_first([
     ("engine", "fetch_odds"),
     ("engine", "get_odds"),
 ])
-
 _find_arbs = _find_first([
     ("arbs", "find_arbs"),
     ("arb", "find_arbs"),
@@ -33,29 +36,13 @@ _find_arbs = _find_first([
 ])
 
 if _fetch_odds is None or _find_arbs is None:
-    # You can also hard-code your actual import here once you know it:
-    # from my_module import my_fetch as _fetch_odds, my_arbs as _find_arbs
     missing = []
     if _fetch_odds is None: missing.append("fetch_odds")
     if _find_arbs is None: missing.append("find_arbs")
     raise RuntimeError(
-        "Missing core functions: {}. Either:\n"
-        "  • Rename your existing functions to these names, or\n"
-        "  • Import them in notifier.py and assign:\n"
-        "      _fetch_odds = your_real_fetch\n"
-        "      _find_arbs = your_real_find_arbs\n".format(", ".join(missing))
+        "Missing core functions: {}. Either rename/import your real functions, or edit notifier.py to point at them.\n"
+        "Example:\n  from engine import get_odds as _fetch_odds\n  from engine import find_arbs as _find_arbs".format(", ".join(missing))
     )
-    
-import requests
-from typing import List, Dict, Any, Tuple
-from datetime import datetime, date, time, timedelta
-import pytz
-import math
-import pandas as pd
-
-# --- Your existing helpers here ---
-# def fetch_odds(competitions: List[str]) -> pd.DataFrame: ...
-# def find_arbs(odds_df: pd.DataFrame) -> pd.DataFrame: ...
 
 def send_telegram(token: str, chat_id: str, text: str):
     if not token or not chat_id:
@@ -107,8 +94,8 @@ def run_notifier(
     schedule: Dict[str, Any] | None = None,
 ) -> "pd.DataFrame":
     """Fetch odds for selected competitions, compute arbs, notify via Telegram, and return DataFrame."""
-    odds = fetch_odds(competitions)
-    arbs = find_arbs(odds)
+    odds = _fetch_odds(competitions)
+    arbs = _find_arbs(odds)
     if arbs is None or len(arbs) == 0:
         return arbs
 
