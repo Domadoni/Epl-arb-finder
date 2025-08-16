@@ -18,3 +18,19 @@ Streamlit app + GitHub Actions notifier for English football arbitrage.
 - `PARTNER_BOOKS`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
+
+
+## Streamlit secrets
+Local dev: copy `.streamlit/secrets.toml.template` to `.streamlit/secrets.toml` and populate the values.
+- `[telegram] bot_token`, `chat_id`
+- `[odds_api] api_key`
+
+
+## Mobile-friendly GitHub deploy
+1. Download this ZIP and extract it on your phone.
+2. In GitHub (mobile web/app), create a new repo and upload all files/folders (keep structure).
+3. In the repo → **Settings → Secrets and variables → Actions**:
+   - **Secrets:** `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (optional for alerts)
+   - **Variables:** set thresholds & filters as needed (see above).
+4. For Streamlit Cloud, connect the repo and set the same env as needed.
+5. To use local Streamlit secrets, copy `.streamlit/secrets.toml.template` to `.streamlit/secrets.toml`.
